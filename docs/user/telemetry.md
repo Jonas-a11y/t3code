@@ -62,6 +62,11 @@ publishing setting.
 
 ## Export diagnostics to your own receiver
 
+An administrator can disable server and desktop OTLP export with the
+[managed policy](./managed-policy.md#other-capabilities) limit `otlpExport: false`. It overrides
+environment variables and saved endpoints, also stops browser trace forwarding, and refuses
+endpoint checks. Logs and traces are still stored locally.
+
 To send traces, metrics, or logs to an OpenTelemetry receiver, open
 **Settings > Maintenance > Diagnostics**, select an environment, and enter each signal's OTLP HTTP
 endpoint under **OpenTelemetry export** (for example `http://localhost:4318/v1/traces`). Save, then

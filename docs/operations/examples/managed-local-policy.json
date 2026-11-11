@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "organization": "Example Corp",
+  "settings": {
+    "enableAgentBrowserAccess": { "value": false, "locked": true }
+  },
+  "limits": {
+    "maxRuntimeMode": "approval-required",
+    "clients": ["desktop", "local-browser"],
+    "connect": false,
+    "telemetry": false,
+    "otlpExport": false,
+    "webhookTasks": false,
+    "browserCookieImport": false,
+    "providers": {
+      "allowedDrivers": ["codex", "claudeAgent"],
+      "instances": {
+        "codex": {
+          "locked": true,
+          "binaryPath": "/opt/managed-agents/bin/codex"
+        },
+        "claudeAgent": {
+          "locked": true,
+          "binaryPath": "/opt/managed-agents/bin/claude"
+        }
+      }
+    },
+    "updates": { "mode": "off", "allowNightly": false }
+  }
+}

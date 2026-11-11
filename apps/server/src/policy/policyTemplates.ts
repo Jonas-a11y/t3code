@@ -126,6 +126,12 @@ const policies = (): ReadonlyArray<Policy> => [
     toggle: "Telemetry",
   },
   {
+    id: "OtlpExport",
+    title: "Allow OpenTelemetry export",
+    help: "Disabled stops server and desktop OTLP traces, metrics, and logs, including browser trace forwarding and endpoint checks. Local diagnostics remain available. Product usage data and relay traces follow Allow usage data.",
+    toggle: "OtlpExport",
+  },
+  {
     id: "AllowedDrivers",
     title: "Allowed providers",
     help: "Only the checked providers may run. Threads on other providers stay, marked unavailable.\n\nDisabled or Not Configured: no restriction.",

@@ -25,7 +25,7 @@ import {
   readManagedPolicyFile,
 } from "@t3tools/shared/managedPolicyFile";
 
-import { telemetryChannel } from "../config.ts";
+import * as ServerConfig from "../config.ts";
 import * as ManagedLimits from "./managedLimits.ts";
 import * as ManagedProviders from "./managedProviders.ts";
 import * as ManagedSettings from "./managedSettings.ts";
@@ -70,7 +70,7 @@ export const loadedPolicy = Effect.fn("ManagedPolicy.loadedPolicy")(function* (
  */
 export function deniedBy(
   policy: Pick<ManagedPolicy["Service"], "document">,
-  capability: "webhookTasks" | "telemetry",
+  capability: "webhookTasks" | "telemetry" | "otlpExport",
 ): string | undefined {
   return policy.document?.limits?.[capability] === false ? policy.document.organization : undefined;
 }
@@ -134,6 +134,7 @@ function summarizeLimits(
     clients,
     webhookTasks,
     telemetry,
+    otlpExport,
     browserCookieImport,
     providers,
     updates,
@@ -145,6 +146,7 @@ function summarizeLimits(
     ...(connect ? {} : { connect: false }),
     ...(webhookTasks === undefined ? {} : { webhookTasks }),
     ...(telemetry === undefined ? {} : { telemetry }),
+    ...(otlpExport === undefined ? {} : { otlpExport }),
     ...(browserCookieImport === undefined ? {} : { browserCookieImport }),
     ...(providers?.allowedDrivers === undefined && Object.keys(lockedInstanceFields).length === 0
       ? {}
@@ -176,7 +178,7 @@ const make = Effect.gen(function* () {
   // Source builds may read a policy from elsewhere so it can be tried without root. Release
   // builds never do: any override a user can set is a way around the policy.
   const devPath =
-    telemetryChannel === "dev"
+    ServerConfig.telemetryChannel === "dev"
       ? yield* Config.option(Config.String("T3CODE_DEV_MANAGED_POLICY_PATH")).pipe(
           Effect.orElseSucceed(() => Option.none<string>()),
         )
@@ -212,6 +214,32 @@ export const layer = Layer.effect(ManagedPolicy, make).pipe(
   Layer.provide(
     layerWindowsRegistry(async () => requireForFfi("ffi-rs") as typeof import("ffi-rs")),
   ),
+);
+
+/** Apply the export limit before any server layer acquires exporters or HTTP routes. */
+export const layerServerConfig = Layer.effect(
+  ServerConfig.ServerConfig,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const policy = yield* ManagedPolicy;
+    if (deniedBy(policy, "otlpExport") === undefined) return config;
+    const {
+      otlpTracesSource: _tracesSource,
+      otlpTracesVariable: _tracesVariable,
+      otlpMetricsSource: _metricsSource,
+      otlpMetricsVariable: _metricsVariable,
+      otlpLogsSource: _logsSource,
+      otlpLogsVariable: _logsVariable,
+      ...remaining
+    } = config;
+    return ServerConfig.make({
+      ...remaining,
+      otlpTracesUrl: undefined,
+      otlpMetricsUrl: undefined,
+      otlpLogsUrl: undefined,
+      otelEnvironment: { ...config.otelEnvironment, disabled: true },
+    });
+  }),
 );
 
 /** A policy for tests; `undefined` means unmanaged. */

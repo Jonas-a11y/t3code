@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 
 import {
@@ -12,6 +13,7 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import { BUILT_IN_DRIVERS } from "../provider/builtInDrivers.ts";
+import * as ServerConfig from "../config.ts";
 import * as ManagedPolicy from "./ManagedPolicy.ts";
 import { disallowedDriverReason, providerHostEnvironment } from "./managedProviders.ts";
 
@@ -60,12 +62,63 @@ it.layer(NodeServices.layer)("ManagedPolicy.load", (it) => {
         JSON.stringify({
           schemaVersion: 1,
           organization: "Example Corp",
-          limits: { webhookTasks: false, telemetry: true },
+          limits: { webhookTasks: false, telemetry: true, otlpExport: false },
         }),
       );
-      assert.deepEqual(policy.summary?.limits, { webhookTasks: false, telemetry: true });
+      assert.deepEqual(policy.summary?.limits, {
+        webhookTasks: false,
+        telemetry: true,
+        otlpExport: false,
+      });
       assert.equal(ManagedPolicy.deniedBy(policy, "webhookTasks"), "Example Corp");
       assert.isUndefined(ManagedPolicy.deniedBy(policy, "telemetry"));
+    }),
+  );
+
+  it.effect("removes every resolved OTLP endpoint and its source when export is forbidden", () =>
+    Effect.gen(function* () {
+      const original = yield* ServerConfig.ServerConfig.pipe(
+        Effect.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-managed-otlp-" })),
+      );
+      const configured = {
+        ...original,
+        otlpTracesUrl: "https://environment.example.com/v1/traces",
+        otlpMetricsUrl: "https://bootstrap.example.com/v1/metrics",
+        otlpLogsUrl: "https://settings.example.com/v1/logs",
+        otlpTracesSource: "environment",
+        otlpTracesVariable: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        otlpMetricsSource: "bootstrap",
+        otlpLogsSource: "settings",
+      } as const;
+      for (const otlpExport of [false, true, undefined]) {
+        const config = yield* ServerConfig.ServerConfig.pipe(
+          Effect.provide(
+            ManagedPolicy.layerServerConfig.pipe(
+              Layer.provide(ServerConfig.layer(configured)),
+              Layer.provide(
+                ManagedPolicy.layerTest({
+                  schemaVersion: 1,
+                  organization: "Example Corp",
+                  limits: otlpExport === undefined ? {} : { otlpExport },
+                }),
+              ),
+            ),
+          ),
+        );
+        if (otlpExport !== false) {
+          assert.strictEqual(config, configured);
+          continue;
+        }
+        assert.isUndefined(config.otlpTracesUrl);
+        assert.isUndefined(config.otlpMetricsUrl);
+        assert.isUndefined(config.otlpLogsUrl);
+        assert.isUndefined(config.otlpTracesSource);
+        assert.isUndefined(config.otlpTracesVariable);
+        assert.isUndefined(config.otlpMetricsSource);
+        assert.isUndefined(config.otlpLogsSource);
+        assert.isTrue(config.otelEnvironment.disabled);
+        assert.equal(config.serverTracePath, configured.serverTracePath);
+      }
     }),
   );
 

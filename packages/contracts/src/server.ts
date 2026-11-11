@@ -315,6 +315,15 @@ export const OtlpEndpointCheckResult = Schema.Union([
 ]);
 export type OtlpEndpointCheckResult = typeof OtlpEndpointCheckResult.Type;
 
+export class OtlpEndpointCheckError extends Schema.TaggedError<OtlpEndpointCheckError>()(
+  "OtlpEndpointCheckError",
+  { organization: Schema.String },
+) {
+  override get message() {
+    return `${this.organization}'s policy does not allow OTLP export.`;
+  }
+}
+
 /** The client tells the server what it is, so the triage context can name it. */
 export const ServerPrepareTriageInput = Schema.Struct({
   client: AuthClientPresentationMetadata,

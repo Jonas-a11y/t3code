@@ -2,9 +2,11 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
+import { ManagedPolicyDocument } from "@t3tools/contracts";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Tracer from "effect/Tracer";
 import * as NetAddress from "effect/net/NetAddress";
 import {
@@ -19,7 +21,10 @@ import {
 import { describe } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as OtlpEndpointCheck from "./OtlpEndpointCheck.ts";
+
+const decodeManagedPolicy = Schema.decodeUnknownSync(ManagedPolicyDocument);
 
 interface PostedRequest {
   readonly url: string;
@@ -32,6 +37,7 @@ const checkWith = (
   status: number | null,
   overrides: Partial<ServerConfig.ServerConfig["Service"]> = {},
   httpClientLayer?: Layer.Layer<HttpClient.HttpClient>,
+  policy?: ManagedPolicyDocument,
 ) => {
   const requests: Array<PostedRequest> = [];
   const httpClient = HttpClient.make((request, _url, signal) => {
@@ -57,6 +63,7 @@ const checkWith = (
     }),
   ).pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-otlp-check-" })));
   const layer = OtlpEndpointCheck.layer.pipe(
+    Layer.provide(ManagedPolicy.layerTest(policy)),
     Layer.provide(httpClientLayer ?? Layer.succeed(HttpClient.HttpClient, httpClient)),
     Layer.provide(configLayer),
     Layer.provide(NodeServices.layer),
@@ -71,6 +78,28 @@ const check = (input: Parameters<OtlpEndpointCheck.OtlpEndpointCheck["Service"][
   });
 
 describe("OtlpEndpointCheck", () => {
+  it.effect(
+    "refuses endpoint checks without sending a request when policy forbids OTLP export",
+    () => {
+      const policy = decodeManagedPolicy({
+        schemaVersion: 1,
+        organization: "Example Corp",
+        limits: { otlpExport: false },
+      });
+      const { requests, layer } = checkWith(200, {}, undefined, policy);
+      return Effect.gen(function* () {
+        for (const signal of ["traces", "metrics", "logs"] as const) {
+          const error = yield* check({
+            signal,
+            url: `https://collector.example.com/v1/${signal}`,
+          }).pipe(Effect.flip);
+          assert.equal(error.message, "Example Corp's policy does not allow OTLP export.");
+        }
+        assert.lengthOf(requests, 0);
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
   it.effect("keeps T3 credentials paired with each running signal endpoint", () => {
     const signalExport = { ...DEFAULT_SIGNAL_EXPORT, headers: { "x-api-key": "secret" } };
     const { requests, layer } = checkWith(200, {

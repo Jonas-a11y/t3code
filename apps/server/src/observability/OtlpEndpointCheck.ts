@@ -3,6 +3,7 @@ import type {
   OtlpEndpointCheckResult,
   OtlpSignal,
 } from "@t3tools/contracts";
+import { OtlpEndpointCheckError } from "@t3tools/contracts";
 import { layerOtlpSerialization } from "@t3tools/shared/observability";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -13,13 +14,16 @@ import { FetchHttpClient, HttpClient } from "effect/http";
 import { OtlpSerialization } from "effect/observability";
 
 import * as ServerConfig from "../config.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 
 const CHECK_TIMEOUT = "5 seconds";
 
 export class OtlpEndpointCheck extends Context.Service<
   OtlpEndpointCheck,
   {
-    readonly check: (input: OtlpEndpointCheckInput) => Effect.Effect<OtlpEndpointCheckResult>;
+    readonly check: (
+      input: OtlpEndpointCheckInput,
+    ) => Effect.Effect<OtlpEndpointCheckResult, OtlpEndpointCheckError>;
   }
 >()("t3/observability/OtlpEndpointCheck") {}
 
@@ -39,6 +43,7 @@ const emptyExport = (
 
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
+  const policy = yield* ManagedPolicy.ManagedPolicy;
   const httpClient = yield* HttpClient.HttpClient;
 
   const running = {
@@ -51,6 +56,10 @@ const make = Effect.gen(function* () {
     signal,
     url,
   }: OtlpEndpointCheckInput) {
+    const organization = ManagedPolicy.deniedBy(policy, "otlpExport");
+    if (organization !== undefined) {
+      return yield* new OtlpEndpointCheckError({ organization });
+    }
     const { url: runningUrl, export: signalExport } = running[signal];
     const headers = url === runningUrl ? signalExport.headers : undefined;
     const body = yield* Effect.gen(function* () {

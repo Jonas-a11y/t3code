@@ -1,4 +1,6 @@
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
+import { ManagedPolicyDocument } from "@t3tools/contracts";
+import { ManagedPolicyFileError } from "@t3tools/shared/managedPolicyFile";
 import desktopPackageJson from "../../package.json" with { type: "json" };
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -13,6 +15,7 @@ import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as DesktopConfig from "./DesktopConfig.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopObservability from "./DesktopObservability.ts";
+import * as DesktopManagedPolicy from "./DesktopManagedPolicy.ts";
 
 const DesktopBackendChildLogRecord = Schema.Struct({
   message: Schema.String,
@@ -39,6 +42,7 @@ const TraceRecordLine = Schema.Struct({
 });
 
 const decodeTraceRecordLine = Schema.decodeUnknownSync(Schema.fromJsonString(TraceRecordLine));
+const decodeManagedPolicy = Schema.decodeUnknownSync(ManagedPolicyDocument);
 
 const environmentInput = (baseDir: string) =>
   ({
@@ -94,7 +98,10 @@ const layerCollector = (requests: Array<ExportedRequest>) =>
   );
 
 // A developer's own OTEL_* variables would otherwise pick the endpoints.
-const layerEmptyEnv = ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }));
+const layerEmptyEnv = Layer.mergeAll(
+  ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })),
+  DesktopManagedPolicy.layerTest(),
+);
 
 const encodeObservabilitySettingsFile = Schema.encodeSync(
   Schema.fromJsonString(
@@ -309,8 +316,101 @@ describe("DesktopObservability", () => {
           NodeServices.layer,
           layerCollector(requests),
           ConfigProvider.layer(ConfigProvider.fromEnv({ env: { OTEL_SDK_DISABLED: "true" } })),
+          DesktopManagedPolicy.layerTest(),
         ),
       ),
+    );
+  });
+
+  it.effect("keeps logs and traces local when policy forbids OTLP export", () => {
+    const requests: Array<ExportedRequest> = [];
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-desktop-managed-observability-",
+      });
+      const layerEnvironment = layerEnvironmentFor(baseDir, true, {
+        T3CODE_OTLP_TRACES_URL: "https://environment.example.com/v1/traces",
+        T3CODE_OTLP_LOGS_URL: "https://environment.example.com/v1/logs",
+      });
+      const { logDir, path } = yield* DesktopEnvironment.DesktopEnvironment.pipe(
+        Effect.provide(layerEnvironment),
+      );
+      yield* writeObservabilitySettings(layerEnvironment, {
+        otlpTracesUrl: "https://settings.example.com/v1/traces",
+        otlpLogsUrl: "https://settings.example.com/v1/logs",
+      });
+      const policy = decodeManagedPolicy({
+        schemaVersion: 1,
+        organization: "Example Corp",
+        limits: { otlpExport: false },
+      });
+
+      yield* Effect.scoped(
+        Effect.logInfo("managed desktop log").pipe(
+          Effect.withSpan("managed-desktop-trace"),
+          Effect.provide(
+            DesktopObservability.layer.pipe(
+              Layer.provideMerge(layerEnvironment),
+              Layer.provide(DesktopManagedPolicy.layerTest(policy)),
+            ),
+          ),
+        ),
+      );
+
+      assert.lengthOf(requests, 0);
+      assert.include(
+        yield* fileSystem.readFileString(path.join(logDir, "desktop.trace.ndjson")),
+        "managed-desktop-trace",
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          layerCollector(requests),
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({
+              env: {
+                T3CODE_OTEL_SDK_DISABLED: "false",
+                OTEL_EXPORTER_OTLP_ENDPOINT: "https://otel.example.com",
+              },
+            }),
+          ),
+        ),
+      ),
+    );
+  });
+
+  it.effect("refuses to acquire exporters when the desktop policy cannot be read", () => {
+    const requests: Array<ExportedRequest> = [];
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-desktop-invalid-policy-",
+      });
+      const layerEnvironment = layerEnvironmentFor(baseDir, false, {
+        T3CODE_OTLP_TRACES_URL: "https://collector.example.com/v1/traces",
+        T3CODE_OTLP_LOGS_URL: "https://collector.example.com/v1/logs",
+      });
+      const policyError = new ManagedPolicyFileError({
+        path: "/test/policy.json",
+        reason: "invalid JSON",
+      });
+      const error = yield* Effect.logInfo("desktop cannot start").pipe(
+        Effect.provide(
+          DesktopObservability.layer.pipe(
+            Layer.provideMerge(layerEnvironment),
+            Layer.provide(DesktopManagedPolicy.layerTest(policyError)),
+          ),
+        ),
+        Effect.flip,
+      );
+      assert.strictEqual(error, policyError);
+      assert.lengthOf(requests, 0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(NodeServices.layer, layerCollector(requests), layerEmptyEnv)),
     );
   });
 

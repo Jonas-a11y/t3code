@@ -1231,4 +1231,8 @@ const layerMakeServer = Layer.unwrap(
   }),
 ).pipe(Layer.provide(ProcessRunner.layer));
 
-export const runServer = Layer.launch(layerMakeServer);
+export const runServer = Layer.launch(
+  layerMakeServer.pipe(
+    Layer.provide(ManagedPolicy.layerServerConfig.pipe(Layer.provideMerge(ManagedPolicy.layer))),
+  ),
+);
