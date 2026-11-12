@@ -1,5 +1,9 @@
 import { render } from "../../../test/render";
-import { DEFAULT_SERVER_SETTINGS, type ServerObservability } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type ManagedPolicySummary,
+  type ServerObservability,
+} from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
@@ -9,6 +13,7 @@ const { state, updateSettings, checkOtlpEndpoint, checkOtlpEndpointCommand } = v
     serverConfig: { environment: { capabilities: {} } } as {
       environment: { capabilities: { otlpEndpointCheck?: boolean } };
       observability?: ServerObservability;
+      managedPolicy?: ManagedPolicySummary;
     },
   },
   updateSettings: vi.fn(async () => ({ _tag: "Success" as const, value: undefined })),
@@ -68,6 +73,34 @@ function setup() {
 }
 
 describe("TelemetryExportSettings", () => {
+  it("shows the policy refusal instead of probing or editing saved endpoints", async () => {
+    setup();
+    state.observability = {
+      ...DEFAULT_SERVER_SETTINGS.observability,
+      otlpTracesUrl: "http://collector/v1/traces",
+      otlpMetricsUrl: "http://collector/v1/metrics",
+      otlpLogsUrl: "http://collector/v1/logs",
+    };
+    state.serverConfig = {
+      environment: { capabilities: { otlpEndpointCheck: true } },
+      managedPolicy: {
+        organization: "Example Corp",
+        lockedSettings: [],
+        limits: { otlpExport: false },
+      },
+    };
+    await using screen = await render(<TelemetryExportSettings />);
+
+    await expect
+      .element(
+        screen.getByText("Example Corp's policy does not allow OTLP export.", { exact: false }),
+      )
+      .toBeInTheDocument();
+    expect(screen.container.querySelector("input, form")).toBeNull();
+    expect(checkOtlpEndpoint).not.toHaveBeenCalled();
+    expect(updateSettings).not.toHaveBeenCalled();
+  });
+
   it("does not resend a field the user restored after another client changed it", async () => {
     setup();
     state.observability = {

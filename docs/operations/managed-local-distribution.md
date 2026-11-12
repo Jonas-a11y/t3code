@@ -21,6 +21,8 @@ organizational approval. The following work remains for a deployment review:
 | Installed-package verification   | Execute the matrix below on an isolated machine, including negative cases, and retain sanitized network observations for desktop, server, renderer, and agents.                | Source-level evidence exists; full package exercise is open.                        |
 | Release provenance and licensing | Record the exact commit, lockfile and artifact hashes, dependency inventory, license notices, and vulnerability findings with their disposition.                               | Candidate and hashes exist; inventory and assessment are open.                      |
 | Signing and distribution         | Resolve app identity and policy domain, produce signed/notarized macOS artifacts, and define a controlled delivery path.                                                       | Candidate retains upstream identity and has only an ad-hoc signature.               |
+| Host protections                 | Assess host, server, and agent sandbox boundaries, hardened-runtime exceptions, privacy permissions, and subprocess exit or consent behavior.                                  | Renderer isolation exists; the remaining protection evidence is open.               |
+| Security updates                 | Establish patch monitoring, deadlines, inventory, enforced rollout, and tested update failure and data recovery procedures.                                                    | Updates are off in the example; no replacement service or update exercise exists.   |
 | Operations and review submission | Assign update, gateway, signing, policy, retention, incident, and rollback owners; assemble the evidence and clearly identify remaining limitations.                           | Open.                                                                               |
 
 An early assessment can discuss these gaps before rollout work is complete. The reviewing
@@ -56,7 +58,7 @@ Use a clean checkout of an exact reviewed commit, the Node version in `package.j
 a Rust toolchain for the target platform's resource monitor. macOS packaging also requires Xcode
 command-line tools. Include the repository's `assets/` directory if using a sparse checkout.
 Do not copy a developer's `.env`, `.env.local`, credentials, or T3 data into the checkout. Keep
-Clerk and relay tracing build variables unset, including their `VITE_` aliases. In particular,
+Clerk publishable keys and relay tracing build variables unset, including their `VITE_` aliases. In particular,
 do not configure `T3CODE_RELAY_CLIENT_OTLP_TRACES_URL`,
 `T3CODE_RELAY_CLIENT_OTLP_TRACES_DATASET`, or `T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN`.
 The locally served renderer sends its ordinary diagnostic traces only to its local server;
@@ -73,8 +75,14 @@ T3CODE_TELEMETRY_CHANNEL=stable vp run dist:desktop:artifact \
 Choose the version to match the reviewed upstream baseline. Setting the telemetry build channel
 to `stable` disables the source-only managed-policy path override; it does not enable analytics
 against the policy. The artifact command defaults to an unsigned build and never publishes. Use
-`--signed` with your distribution's signing and notarization credentials for a deliverable macOS
-package. Keep those credentials in the build system. The build retains T3's application identity
+`--signed` to enable signing and notarization discovery. The current signed macOS build also
+requires `T3CODE_APPLE_TEAM_ID`, `T3CODE_MACOS_PROVISIONING_PROFILE` for an Associated Domains
+profile, and explicit `T3CODE_CLERK_PASSKEY_RP_DOMAINS` matching that profile. Resolve the app
+identity and these passkey entitlements with the signing owner first; do not enable a Clerk
+service merely to satisfy the build. The explicit RP domains are signing configuration, not a
+Clerk publishable key or relay tracing configuration. Keep signing and notarization credentials
+in the build system. The signing hook alone does not notarize the app: verify notarization and
+stapling on the final package before distributing it. The build retains T3's application identity
 and policy domain, so install a candidate only on an isolated test machine or replace the managed
 installation deliberately.
 
@@ -113,6 +121,14 @@ those with the operating environment and the providers' own settings. Users with
 rights can replace the application or remove its policy.
 
 ## Maintain the distribution
+
+With `updates.mode: "off"`, an approved device-management service must replace packages, track
+installed versions, and enforce the agreed patch deadlines. Confirm that this approach meets
+the organization's update requirements before rollout. If an app-managed update channel is
+required, use the existing `feedUrl` mirror and disable nightly updates. The `auto` mode checks
+automatically but installs on user request; it does not enforce deadlines. Test successful and
+failed updates and data recovery. Manage the separately installed agent CLIs, provider policy
+and configuration, and model or MCP services as separate update units.
 
 Assign owners for gateway configuration, package signing, policy rollout, security updates, and
 review of new data flows. Rebase small changes onto upstream, review new dependencies and

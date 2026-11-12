@@ -210,6 +210,7 @@ export function clampManagedRuntimeMode(
 const CAPABILITY_LABELS = {
   remoteClients: "connecting from other devices",
   connect: "T3 Connect",
+  otlpExport: "OTLP export",
   webhookTasks: "webhook tasks",
   browserCookieImport: "importing browser cookies",
 } as const;

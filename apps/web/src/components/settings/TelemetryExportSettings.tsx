@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { OtlpEndpointCheckResult, OtlpSignal, ServerObservability } from "@t3tools/contracts";
+import { managedCapabilityDenial } from "@t3tools/contracts";
 import { useEffect, useEffectEvent, useState } from "react";
 
 import { serverEnvironment } from "../../state/server";
@@ -79,6 +80,16 @@ export function TelemetryExportSettings() {
         <SettingsScopeNotice target="environment">
           Choose one environment to configure its telemetry exports.
         </SettingsScopeNotice>
+      </SettingsSection>
+    );
+  }
+  const denial = managedCapabilityDenial(environment.serverConfig?.managedPolicy, "otlpExport");
+  if (denial !== undefined) {
+    return (
+      <SettingsSection title="OpenTelemetry export" id="telemetry-export">
+        <p className="px-4 py-4 text-xs text-muted-foreground sm:px-5">
+          {denial} Logs and traces remain stored locally.
+        </p>
       </SettingsSection>
     );
   }

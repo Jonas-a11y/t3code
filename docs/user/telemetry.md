@@ -65,7 +65,8 @@ publishing setting.
 An administrator can disable server and desktop OTLP export with the
 [managed policy](./managed-policy.md#other-capabilities) limit `otlpExport: false`. It overrides
 environment variables and saved endpoints, also stops browser trace forwarding, and refuses
-endpoint checks. Logs and traces are still stored locally.
+endpoint checks. Logs and traces are still stored locally. This limit is separate from product
+events and relay diagnostics described above.
 
 To send traces, metrics, or logs to an OpenTelemetry receiver, open
 **Settings > Maintenance > Diagnostics**, select an environment, and enter each signal's OTLP HTTP
