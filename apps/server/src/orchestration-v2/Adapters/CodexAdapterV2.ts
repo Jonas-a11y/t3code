@@ -1,5 +1,6 @@
 import { pipe } from "effect/Function";
 import * as DocumentText from "../../provider/DocumentText.ts";
+import { readCodexImageContext } from "../../provider/CodexImageContext.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -157,6 +158,8 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const CODEX_PROVIDER = ProviderDriverKind.make("codex");
+// Codex exposes images after delivery, so leave headroom below its 50-image limit.
+const CODEX_IMAGE_COMPACTION_THRESHOLD = 40;
 const CODEX_CAPACITY_MAX_RETRIES = 5;
 // Codex can announce a retry and never resume. Recovered retries resume model output within ~75s.
 const CODEX_PROVIDER_RETRY_STALL_TIMEOUT = "10 minutes";
@@ -526,6 +529,31 @@ function codexMcpAppResourceUri(item: CodexDynamicToolItem): string | undefined 
 }
 
 const CODEX_IMAGE_DATA_URL = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i;
+
+function codexCompletedItemImageCount(item: CodexSchema.V2ItemCompletedNotification__ThreadItem) {
+  switch (item.type) {
+    case "imageView":
+      return 1;
+    case "mcpToolCall":
+      return (
+        item.result?.content.filter(
+          (block) =>
+            block !== null &&
+            typeof block === "object" &&
+            "type" in block &&
+            block.type === "image",
+        ).length ?? 0
+      );
+    case "dynamicToolCall":
+      return item.contentItems?.filter((block) => block.type === "inputImage").length ?? 0;
+    case "functionCallOutput":
+      return Array.isArray(item.output)
+        ? item.output.filter((block) => block.type === "input_image").length
+        : 0;
+    default:
+      return 0;
+  }
+}
 
 export function codexDynamicToolOutput(
   item: Extract<CodexDynamicToolItem, { readonly type: "dynamicToolCall" }>,
@@ -1205,7 +1233,7 @@ function failureResetAt(
 interface ActiveCodexTurnContext {
   hookStopReason?: string;
   capacityRetryAttempt?: number;
-  capacityRetryPending?: Deferred.Deferred<ActiveCodexTurnContext | undefined>;
+  continuationPending?: Deferred.Deferred<ActiveCodexTurnContext | undefined>;
   closedCommandItemIds?: ReadonlySet<string>;
   latestProviderFailure?: {
     readonly nativeMessage: string;
@@ -2034,10 +2062,59 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const rootProviderThreads = new Map<string, OrchestrationV2ProviderThread>();
         const goalHolds = new Map<string, CodexGoalHold>();
         const continuedRuns = new Map<ProviderTurnId, Array<ActiveCodexTurnContext>>();
-        const capacityContinuations = new Map<
+        const runContinuations = new Map<
           string,
-          { readonly context: ActiveCodexTurnContext; readonly retry: ActiveCodexProviderRetry }
+          { readonly context: ActiveCodexTurnContext; readonly retry?: ActiveCodexProviderRetry }
         >();
+        const imageCounts = new Map<
+          string,
+          { readonly path: string; count: number; disabled: boolean; readonly seen: Set<string> }
+        >();
+        const imageCompactions = new Map<
+          string,
+          {
+            phase: "interrupting" | "compacting" | "checking" | "resuming";
+            stopped: boolean;
+            readonly resumeInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
+            readonly done: Deferred.Deferred<void, ProviderAdapter.ProviderAdapterProtocolError>;
+          }
+        >();
+        const imageCompactionEnabled = (resolvedRuntime?.config ?? adapterOptions.settings)
+          .autoCompactImages;
+        const freshNativeThreads = new Set<string>();
+        const readRetainedImages = (path: string) =>
+          readCodexImageContext(path).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+        const readImageCount = Effect.fn("CodexAdapterV2.readImageCount")(function* (
+          threadId: string,
+        ) {
+          const response = yield* client.request("thread/read", { threadId, includeTurns: false });
+          if (response.thread.path == null)
+            return yield* toProtocolError(
+              "Automatic image compaction requires a readable Codex session. Disable the experiment to continue.",
+            );
+          // Fresh Codex threads defer creating their rollout until the first user message.
+          const count =
+            freshNativeThreads.has(threadId) && !(yield* fileSystem.exists(response.thread.path))
+              ? 0
+              : yield* readRetainedImages(response.thread.path);
+          imageCounts.set(threadId, {
+            path: response.thread.path,
+            count,
+            disabled: false,
+            seen: new Set(),
+          });
+          return count;
+        });
         const goalActivations = new Map<string, { stopped: boolean }>();
         // Held runs must not complete while Stop resolves its target.
         const goalStops = new Map<string, number>();
@@ -2224,21 +2301,21 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           };
           const nativeThreadId = input.turnInput.providerThread.nativeThreadRef?.nativeId;
           const continuation =
-            nativeThreadId == null ? undefined : capacityContinuations.get(nativeThreadId);
+            nativeThreadId == null ? undefined : runContinuations.get(nativeThreadId);
           if (continuation !== undefined) {
             context.capacityRetryAttempt = continuation.context.capacityRetryAttempt ?? 0;
-            yield* Ref.update(providerRetries, (current) =>
-              new Map(current).set(providerTurnId, continuation.retry),
-            );
+            if (continuation.retry !== undefined) {
+              const retry = continuation.retry;
+              yield* Ref.update(providerRetries, (current) =>
+                new Map(current).set(providerTurnId, retry),
+              );
+            }
             const turns = continuedRuns.get(continuation.context.providerTurnId) ?? [
               continuation.context,
             ];
             turns.push(context);
             continuedRuns.set(continuation.context.providerTurnId, turns);
             continuedRuns.set(providerTurnId, turns);
-            if (continuation.context.capacityRetryPending !== undefined) {
-              yield* Deferred.succeed(continuation.context.capacityRetryPending, context);
-            }
           }
           yield* Ref.update(limitedTurnItems, (current) => {
             const next = new Map(current);
@@ -2253,8 +2330,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             return updated;
           });
           if (continuation !== undefined && nativeThreadId != null) {
-            capacityContinuations.delete(nativeThreadId);
+            runContinuations.delete(nativeThreadId);
           }
+          if (continuation?.context.continuationPending !== undefined)
+            yield* Deferred.succeed(continuation.context.continuationPending, context);
           yield* emitProviderEvent({
             type: "provider_turn.updated",
             driver: CODEX_PROVIDER,
@@ -5192,6 +5271,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return;
             }
             const { context, settled } = resolved;
+            if (imageCompactionEnabled && !settled && context.subagent === null) {
+              const images = imageCounts.get(payload.threadId);
+              const count = codexCompletedItemImageCount(payload.item);
+              if (images !== undefined && count > 0 && !images.seen.has(payload.item.id)) {
+                images.seen.add(payload.item.id);
+                images.count += count;
+                yield* interruptForImages(context).pipe(
+                  Effect.forkIn(scope, { startImmediately: true }),
+                );
+              }
+            }
 
             if (payload.item.type === "reasoning") {
               yield* completeReasoning(payload.turnId, payload.item);
@@ -6362,6 +6452,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (current !== input.context) {
                 return false;
               }
+              if (!input.continueRun && input.context.subagent === null) {
+                const threadId = input.context.providerThread.nativeThreadRef?.nativeId;
+                const cycle = threadId == null ? undefined : imageCompactions.get(threadId);
+                if (cycle !== undefined && threadId != null) {
+                  imageCompactions.delete(threadId);
+                  yield* Deferred.fail(
+                    cycle.done,
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CODEX_PROVIDER,
+                      detail: "Automatic image compaction stopped.",
+                    }),
+                  );
+                }
+              }
               if (input.stalledRetry !== undefined) {
                 // Checked under the permit so item/started cannot clear the retry mid-finalize.
                 const retries = yield* Ref.get(providerRetries);
@@ -6550,8 +6654,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   parent.subagent === null &&
                   (input.status === "completed" || input.status === "failed") &&
                   !(yield* Ref.get(terminalizedNonCompletedNativeTurns)).has(parent.nativeTurnId) &&
-                  (parentNativeThreadId == null ||
-                    !capacityContinuations.has(parentNativeThreadId)) &&
+                  (parentNativeThreadId == null || !runContinuations.has(parentNativeThreadId)) &&
                   ![...(yield* Ref.get(activeTurns)).values()].some(
                     (active) =>
                       active.subagent === null &&
@@ -6645,8 +6748,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (input.context.nativeStartReady !== undefined) {
                 yield* Deferred.succeed(input.context.nativeStartReady, undefined);
               }
-              if (!input.continueRun && input.context.capacityRetryPending !== undefined) {
-                yield* Deferred.succeed(input.context.capacityRetryPending, undefined);
+              if (!input.continueRun && input.context.continuationPending !== undefined) {
+                yield* Deferred.succeed(input.context.continuationPending, undefined);
               }
               yield* flushReadyRootTerminals();
               if (!retainSettledContext && !interruptInProgress) {
@@ -6754,7 +6857,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           return yield* turnTerminalizationPermit.withPermits(1)(
             Effect.gen(function* () {
               if ((yield* Ref.get(activeTurns)).get(terminal.nativeTurnId) !== context) return true;
-              if (context.capacityRetryPending !== undefined) return true;
+              if (context.continuationPending !== undefined) return true;
               if (
                 (context.capacityRetryAttempt ?? 0) >= CODEX_CAPACITY_MAX_RETRIES ||
                 (yield* Ref.get(interruptingNativeTurns)).has(terminal.nativeTurnId)
@@ -6764,7 +6867,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const attempt = (context.capacityRetryAttempt ?? 0) + 1;
               context.capacityRetryAttempt = attempt;
               const pending = yield* Deferred.make<ActiveCodexTurnContext | undefined>();
-              context.capacityRetryPending = pending;
+              context.continuationPending = pending;
               const retryDelayMs = Math.min(2_000 * 2 ** (attempt - 1), 30_000);
               const now = yield* DateTime.now;
               const previous = (yield* Ref.get(providerRetries)).get(context.providerTurnId);
@@ -6811,7 +6914,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                           (yield* Ref.get(interruptingNativeTurns)).has(terminal.nativeTurnId)
                         )
                           return false;
-                        capacityContinuations.set(nativeThreadId, { context, retry: state });
+                        runContinuations.set(nativeThreadId, { context, retry: state });
                         yield* finalizeCodexTurn({ ...terminal, continueRun: true });
                         return true;
                       }),
@@ -6853,8 +6956,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       ),
                       Effect.ensuring(
                         Effect.sync(() => {
-                          if (capacityContinuations.get(nativeThreadId)?.context === context)
-                            capacityContinuations.delete(nativeThreadId);
+                          if (runContinuations.get(nativeThreadId)?.context === context)
+                            runContinuations.delete(nativeThreadId);
                         }),
                       ),
                     );
@@ -6867,10 +6970,230 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           );
         });
 
+        const makeImageCompaction = Effect.fn("CodexAdapterV2.makeImageCompaction")(function* (
+          phase: "interrupting" | "compacting",
+          resumeInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
+        ) {
+          return {
+            phase: phase as "interrupting" | "compacting" | "checking" | "resuming",
+            stopped: false,
+            resumeInput,
+            done: yield* Deferred.make<void, ProviderAdapter.ProviderAdapterProtocolError>(),
+          };
+        });
+
+        const interruptForImages = Effect.fn("CodexAdapterV2.interruptForImages")(function* (
+          context: ActiveCodexTurnContext,
+          incoming = 0,
+        ) {
+          const threadId = context.providerThread.nativeThreadRef?.nativeId;
+          if (
+            threadId == null ||
+            context.subagent !== null ||
+            imageCompactions.has(threadId) ||
+            goalsByNativeThread.get(threadId)?.status === "active" ||
+            imageCounts.get(threadId)?.disabled ||
+            (yield* Ref.get(interruptingNativeTurns)).has(context.nativeTurnId) ||
+            (imageCounts.get(threadId)?.count ?? 0) + incoming < CODEX_IMAGE_COMPACTION_THRESHOLD
+          )
+            return;
+          const cycle = yield* makeImageCompaction("interrupting", []);
+          imageCompactions.set(threadId, cycle);
+          yield* client.request("turn/interrupt", { threadId, turnId: context.nativeTurnId }).pipe(
+            Effect.timeout("10 seconds"),
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                if (imageCompactions.get(threadId) !== cycle || cycle.phase !== "interrupting")
+                  return;
+                imageCompactions.delete(threadId);
+                const error = new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail:
+                    "Could not interrupt Codex for automatic image compaction. Stop the thread and retry.",
+                  cause,
+                });
+                yield* Deferred.fail(cycle.done, error);
+                const images = imageCounts.get(threadId);
+                if (images !== undefined) images.disabled = true;
+                yield* emitProviderEvent({
+                  type: "turn_item.updated",
+                  driver: CODEX_PROVIDER,
+                  turnItem: makeProviderFailureTurnItem({
+                    driver: CODEX_PROVIDER,
+                    threadId: context.projectionThreadId,
+                    runId: context.projectionRunId,
+                    nodeId: context.providerNodeId,
+                    providerThreadId: context.providerThread.id,
+                    providerTurnId: context.providerTurnId,
+                    itemOrdinal: yield* resolveItemOrdinal(
+                      context,
+                      "image-compaction-interrupt-failed",
+                    ),
+                    failure: makeProviderFailure({
+                      message: error.detail,
+                      class: "provider_error",
+                    }),
+                    occurredAt: yield* DateTime.now,
+                  }),
+                });
+              }),
+            ),
+          );
+          return cycle;
+        });
+
+        const continueImageCompaction = Effect.fn("CodexAdapterV2.continueImageCompaction")(
+          function* (terminal: Parameters<typeof finalizeCodexTurn>[0]) {
+            const threadId = terminal.context.providerThread.nativeThreadRef?.nativeId;
+            const cycle = threadId == null ? undefined : imageCompactions.get(threadId);
+            if (cycle === undefined || threadId == null || cycle.phase === "resuming") return false;
+            if (cycle.phase === "checking") return true;
+            if (
+              cycle.stopped ||
+              (yield* Ref.get(interruptingNativeTurns)).has(terminal.nativeTurnId) ||
+              (terminal.status !== (cycle.phase === "interrupting" ? "interrupted" : "completed") &&
+                !(
+                  cycle.phase === "interrupting" &&
+                  terminal.status === "failed" &&
+                  (terminal.failureErrorInfo == null
+                    ? terminal.context.latestProviderFailure?.nativeCode
+                    : codexErrorInfoCode(terminal.failureErrorInfo)) === "serverOverloaded"
+                ))
+            ) {
+              imageCompactions.delete(threadId);
+              yield* Deferred.fail(
+                cycle.done,
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Automatic image compaction stopped.",
+                }),
+              );
+              yield* finalizeCodexTurn(terminal);
+              return true;
+            }
+            const compactNext = cycle.phase === "interrupting";
+            cycle.phase = "checking";
+            const nextInput = {
+              ...terminal.context.input,
+              providerTurnOrdinal: terminal.context.providerTurnOrdinal + 1,
+            };
+            // Requests must run off the notification reader so it can deliver their responses.
+            yield* Effect.gen(function* () {
+              if (!compactNext) {
+                const images = imageCounts.get(threadId)!;
+                images.count = yield* readRetainedImages(images.path);
+                images.seen.clear();
+                const incoming = cycle.resumeInput.filter(
+                  (item) => item.type === "image" || item.type === "localImage",
+                ).length;
+                if (images.count + incoming >= CODEX_IMAGE_COMPACTION_THRESHOLD)
+                  return yield* toProtocolError(
+                    "Compaction retained too many images to continue safely. Start a new thread or reduce the attached images.",
+                  );
+                images.count += incoming;
+              }
+              const pending = yield* Deferred.make<ActiveCodexTurnContext | undefined>();
+              terminal.context.continuationPending = pending;
+              const claimed = yield* turnTerminalizationPermit.withPermits(1)(
+                Effect.gen(function* () {
+                  if ((yield* Ref.get(activeTurns)).get(terminal.nativeTurnId) !== terminal.context)
+                    return false;
+                  if (
+                    cycle.stopped ||
+                    (yield* Ref.get(interruptingNativeTurns)).has(terminal.nativeTurnId)
+                  ) {
+                    yield* finalizeCodexTurn({
+                      ...terminal,
+                      status: "interrupted",
+                      continueRun: true,
+                    });
+                    yield* emitOrDeferRootTerminal({ ...terminal, status: "interrupted" });
+                    return false;
+                  }
+                  runContinuations.set(threadId, { context: terminal.context });
+                  cycle.phase = compactNext ? "compacting" : "resuming";
+                  return yield* finalizeCodexTurn({ ...terminal, continueRun: true });
+                }),
+              );
+              if (!claimed) {
+                yield* Deferred.succeed(pending, undefined);
+                if (imageCompactions.get(threadId) === cycle) imageCompactions.delete(threadId);
+                yield* Deferred.fail(
+                  cycle.done,
+                  new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CODEX_PROVIDER,
+                    detail: "Automatic image compaction stopped.",
+                  }),
+                );
+                return;
+              }
+              if (compactNext) yield* startCompaction(nextInput);
+              else yield* startNativeTurn(nextInput, cycle.resumeInput);
+              const next = yield* Deferred.await(pending).pipe(Effect.timeout("10 seconds"));
+              if (!compactNext) {
+                if (imageCompactions.get(threadId) === cycle) imageCompactions.delete(threadId);
+                yield* Deferred.succeed(cycle.done, undefined);
+                const context =
+                  next === undefined
+                    ? undefined
+                    : (yield* Ref.get(activeTurns)).get(next.nativeTurnId);
+                if (context !== undefined) yield* interruptForImages(context);
+              }
+            }).pipe(
+              Effect.catch((cause) =>
+                Effect.gen(function* () {
+                  const error =
+                    cause._tag === "ProviderAdapterProtocolError"
+                      ? cause
+                      : new ProviderAdapter.ProviderAdapterProtocolError({
+                          driver: CODEX_PROVIDER,
+                          detail:
+                            "Automatic image compaction could not continue. Retry the message or disable the experiment.",
+                          cause,
+                        });
+                  yield* Effect.logWarning("orchestration-v2.codex-image-compaction-failed", {
+                    threadId,
+                    cause,
+                  });
+                  yield* Deferred.fail(cycle.done, error);
+                  if (imageCompactions.get(threadId) !== cycle) return;
+                  imageCompactions.delete(threadId);
+                  yield* Ref.update(pendingRootTurns, (current) => {
+                    if (current.get(threadId) !== nextInput) return current;
+                    const next = new Map(current);
+                    next.delete(threadId);
+                    return next;
+                  });
+                  yield* turnTerminalizationPermit.withPermits(1)(
+                    Effect.gen(function* () {
+                      const waitingStart =
+                        runContinuations.get(threadId)?.context === terminal.context;
+                      if (waitingStart) runContinuations.delete(threadId);
+                      const failed = {
+                        ...terminal,
+                        status: cycle.stopped ? ("interrupted" as const) : ("failed" as const),
+                        failureMessage: error.detail,
+                      };
+                      if (yield* finalizeCodexTurn({ ...failed, continueRun: true }))
+                        yield* emitOrDeferRootTerminal(failed);
+                      else if (waitingStart) yield* emitOrDeferRootTerminal(failed);
+                    }),
+                  );
+                  if (terminal.context.continuationPending !== undefined)
+                    yield* Deferred.succeed(terminal.context.continuationPending, undefined);
+                }),
+              ),
+              Effect.forkIn(scope, { startImmediately: true }),
+            );
+            return true;
+          },
+        );
+
         yield* client.handleServerNotification("turn/completed", (payload) =>
           Effect.gen(function* () {
             const compacted = yield* Ref.modify(threadsAwaitingContextRestore, (current) => {
-              if (!current.has(payload.threadId)) return [false, current] as const;
+              if (!current.has(payload.threadId) || imageCompactions.has(payload.threadId))
+                return [false, current] as const;
               const next = new Set(current);
               next.delete(payload.threadId);
               return [true, next] as const;
@@ -6904,7 +7227,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : { failureErrorInfo: payload.turn.error.codexErrorInfo }),
                   }),
             };
-            if (!(yield* retryCapacityFailure(terminal))) yield* finalizeCodexTurn(terminal);
+            if (
+              !(yield* continueImageCompaction(terminal)) &&
+              !(yield* retryCapacityFailure(terminal))
+            )
+              yield* finalizeCodexTurn(terminal);
           }),
         );
 
@@ -7093,12 +7420,38 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           );
         });
 
+        const startCompaction = Effect.fn("CodexAdapterV2.startCompaction")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        ) {
+          const threadId = yield* getNativeThreadId(turnInput.providerThread);
+          yield* Ref.update(pendingRootTurns, (current) =>
+            new Map(current).set(threadId, turnInput),
+          );
+          // A late turn/started must not be adopted after an interrupted start.
+          yield* client.request("thread/compact/start", { threadId }).pipe(
+            Effect.onError(() =>
+              Ref.update(pendingRootTurns, (current) => {
+                const next = new Map(current);
+                next.delete(threadId);
+                return next;
+              }),
+            ),
+          );
+        });
+
         const startNativeTurn = Effect.fn("CodexAdapterV2.startNativeTurn")(
           function* (
             turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
+            const restore = yield* Ref.modify(threadsAwaitingContextRestore, (current) => {
+              if (!current.has(threadId)) return [false, current] as const;
+              const next = new Set(current);
+              next.delete(threadId);
+              return [true, next] as const;
+            });
+            if (restore) yield* restoreAdditionalContext(threadId);
             const mcpSession = yield* mcpSessions.read(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
@@ -7111,6 +7464,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
               ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
             });
+            if (imageCompactions.get(threadId)?.stopped === true)
+              return yield* toProtocolError("Automatic image compaction stopped.");
+            freshNativeThreads.delete(threadId);
             yield* Ref.update(pendingRootTurns, (current) => {
               const updated = new Map(current);
               updated.set(threadId, turnInput);
@@ -7424,6 +7780,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   }),
                 ),
               ),
+              Effect.tap((response) =>
+                Effect.sync(() => {
+                  if (imageCompactionEnabled) freshNativeThreads.add(response.thread.id);
+                }),
+              ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
@@ -7498,22 +7859,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
           ),
           compactThread: Effect.fn("CodexAdapterV2.compactThread")(
-            function* (turnInput) {
-              const threadId = yield* getNativeThreadId(turnInput.providerThread);
-              yield* Ref.update(pendingRootTurns, (current) =>
-                new Map(current).set(threadId, turnInput),
-              );
-              // Clear on interruption; a late turn/started must not be adopted after an interrupted start.
-              yield* client.request("thread/compact/start", { threadId }).pipe(
-                Effect.onError(() =>
-                  Ref.update(pendingRootTurns, (current) => {
-                    const next = new Map(current);
-                    next.delete(threadId);
-                    return next;
-                  }),
-                ),
-              );
-            },
+            (turnInput) => startCompaction(turnInput),
             (effect, turnInput) =>
               effect.pipe(
                 Effect.mapError(
@@ -7537,6 +7883,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   items: historyResponseItems(input.messages, input.context),
                 })
                 .pipe(
+                  Effect.tap(() => Effect.sync(() => freshNativeThreads.delete(threadId))),
                   Effect.as(true),
                   // Retry only unknown-method errors, which precede history mutation. Transport or payload errors leave delivery ambiguous.
                   Effect.catchTags({
@@ -7561,12 +7908,35 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : null;
             if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
             return Effect.gen(function* () {
-              yield* startNativeTurn(
-                turnInput,
+              const codexInput =
                 turnInput.restartContinuationOfRunId === undefined
                   ? yield* toCodexInput(turnInput)
-                  : [],
-              );
+                  : [];
+              if (
+                imageCompactionEnabled &&
+                goalsByNativeThread.get(turnInput.providerThread.nativeThreadRef?.nativeId ?? "")
+                  ?.status !== "active"
+              ) {
+                const threadId = yield* getNativeThreadId(turnInput.providerThread);
+                const incoming = codexInput.filter(
+                  (item) => item.type === "image" || item.type === "localImage",
+                ).length;
+                if (incoming >= CODEX_IMAGE_COMPACTION_THRESHOLD)
+                  return yield* toProtocolError(
+                    "Send fewer than 40 images at once when automatic image compaction is enabled.",
+                  );
+                const count = yield* readImageCount(threadId);
+                if (count + incoming >= CODEX_IMAGE_COMPACTION_THRESHOLD) {
+                  const cycle = yield* makeImageCompaction("compacting", codexInput);
+                  imageCompactions.set(threadId, cycle);
+                  yield* startCompaction(turnInput).pipe(
+                    Effect.onError(() => Effect.sync(() => imageCompactions.delete(threadId))),
+                  );
+                  return;
+                }
+                imageCounts.get(threadId)!.count += incoming;
+              }
+              yield* startNativeTurn(turnInput, codexInput);
             }).pipe(
               Effect.mapError(
                 (cause) =>
@@ -7583,6 +7953,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           steerTurn: Effect.fn("CodexAdapterV2.steerTurn")(
             function* (turnInput) {
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
+              const codexInput = yield* toCodexInput(turnInput);
+              const cycle = imageCompactions.get(threadId);
+              if (cycle !== undefined) yield* Deferred.await(cycle.done);
               const latestTurnId = latestRunTurnId(turnInput.providerTurnId);
               const held = heldGoalTurn(turnInput.providerThread, latestTurnId);
               const providerTurnId =
@@ -7592,12 +7965,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               let activeTurn = Array.from((yield* Ref.get(activeTurns)).values()).find(
                 (candidate) => candidate.providerTurnId === providerTurnId,
               );
-              const startingRetry = capacityContinuations.get(threadId)?.context;
+              const startingRetry = runContinuations.get(threadId)?.context;
               if (activeTurn === undefined && startingRetry?.providerTurnId === providerTurnId) {
                 activeTurn = startingRetry;
               }
-              while (activeTurn?.capacityRetryPending !== undefined) {
-                activeTurn = yield* Deferred.await(activeTurn.capacityRetryPending);
+              while (activeTurn?.continuationPending !== undefined) {
+                activeTurn = yield* Deferred.await(activeTurn.continuationPending);
               }
               if (activeTurn === undefined) {
                 return yield* toProtocolError(
@@ -7605,7 +7978,45 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 );
               }
 
-              const codexInput = yield* toCodexInput(turnInput);
+              if (
+                imageCompactionEnabled &&
+                goalsByNativeThread.get(threadId)?.status !== "active"
+              ) {
+                const images = imageCounts.get(threadId);
+                const incoming = codexInput.filter(
+                  (item) => item.type === "image" || item.type === "localImage",
+                ).length;
+                if (incoming >= CODEX_IMAGE_COMPACTION_THRESHOLD)
+                  return yield* toProtocolError(
+                    "Send fewer than 40 images at once when automatic image compaction is enabled.",
+                  );
+                if (
+                  images !== undefined &&
+                  images.count + incoming >= CODEX_IMAGE_COMPACTION_THRESHOLD
+                ) {
+                  const compaction =
+                    imageCompactions.get(threadId) ??
+                    (yield* interruptForImages(activeTurn, incoming));
+                  if (compaction === undefined)
+                    return yield* toProtocolError(
+                      "This follow-up would exceed the image compaction threshold. Wait for the turn to finish and send it again.",
+                    );
+                  yield* Deferred.await(compaction.done);
+                  if (images.count + incoming >= CODEX_IMAGE_COMPACTION_THRESHOLD)
+                    return yield* toProtocolError(
+                      "Compaction retained too many images to deliver this follow-up. Reduce the attached images or start a new thread.",
+                    );
+                  activeTurn = Array.from((yield* Ref.get(activeTurns)).values()).find(
+                    (candidate) =>
+                      candidate.providerTurnId === latestRunTurnId(turnInput.providerTurnId),
+                  );
+                  if (activeTurn === undefined)
+                    return yield* toProtocolError(
+                      "Codex finished while compacting. Send this follow-up again to start a new turn.",
+                    );
+                }
+                if (images !== undefined) images.count += incoming;
+              }
               yield* client.request("turn/steer", {
                 expectedTurnId: activeTurn.nativeTurnId,
                 input: codexInput,
@@ -7631,6 +8042,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
+              imageCounts.delete(nativeThreadId);
+              freshNativeThreads.delete(nativeThreadId);
               yield* client.request("thread/unsubscribe", { threadId: nativeThreadId });
             },
             (effect, unloadInput) =>
@@ -7649,21 +8062,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           interruptTurn: Effect.fn("CodexAdapterV2.interruptTurn")(
             function* (requestedInput) {
               const nativeThreadId = requestedInput.providerThread.nativeThreadRef?.nativeId;
+              const imageCompaction =
+                nativeThreadId == null ? undefined : imageCompactions.get(nativeThreadId);
+              if (imageCompaction !== undefined) imageCompaction.stopped = true;
               const capacityRetry =
-                nativeThreadId == null
-                  ? undefined
-                  : capacityContinuations.get(nativeThreadId)?.context;
+                nativeThreadId == null ? undefined : runContinuations.get(nativeThreadId)?.context;
               const startingRetry =
                 capacityRetry?.providerTurnId === latestRunTurnId(requestedInput.providerTurnId)
                   ? capacityRetry
                   : undefined;
-              if (startingRetry?.capacityRetryPending !== undefined) {
-                const started = yield* Deferred.await(startingRetry.capacityRetryPending).pipe(
+              if (startingRetry?.continuationPending !== undefined) {
+                const started = yield* Deferred.await(startingRetry.continuationPending).pipe(
                   Effect.timeoutOption("10 seconds"),
                 );
                 if (Option.isNone(started))
                   return yield* toProtocolError(
-                    "Codex did not start the capacity retry within 10 seconds; Stop could not be delivered.",
+                    "Codex did not start the continuation within 10 seconds; Stop could not be delivered.",
                   );
               }
               const { turnInput, goalTurns } = yield* resolveGoalStopTarget(requestedInput);
@@ -7710,7 +8124,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
               ];
               if (interruptTargetContexts.length === 0) {
-                if (turnInput.requestRuntimeRestart === true) return;
+                if (turnInput.requestRuntimeRestart === true || imageCompaction?.stopped === true)
+                  return;
                 return yield* toProtocolError(
                   `Provider turn ${turnInput.providerTurnId} is not active and cannot be interrupted.`,
                 );
@@ -7901,7 +8316,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               yield* Effect.gen(function* () {
                 for (const target of interruptTargets) {
                   const context = target.context;
-                  if (context.capacityRetryPending !== undefined) {
+                  if (context.continuationPending !== undefined) {
                     yield* finalizeCodexTurn({
                       context,
                       nativeTurnId: context.nativeTurnId,
@@ -7924,6 +8339,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   if ((yield* Ref.get(activeTurns)).get(context.nativeTurnId) !== context) {
                     continue;
                   }
+                  // The checking phase has already received the native terminal notification.
+                  if (imageCompaction?.phase === "checking" && context.subagent === null) continue;
                   yield* client.request("turn/interrupt", {
                     threadId: yield* getNativeThreadId(context.providerThread),
                     turnId: context.nativeTurnId,

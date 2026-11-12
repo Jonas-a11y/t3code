@@ -1243,6 +1243,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     onUsageLimits?: CodexAdapterV2.CodexAdapterV2Options["onUsageLimits"],
     promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
     onNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
+    settings: CodexSettings = DEFAULT_CODEX_SETTINGS,
+    resolveRuntime?: CodexAdapterV2.CodexAdapterV2Options["resolveRuntime"],
+    afterRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -1280,6 +1283,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                       request: (method, params) =>
                         onRequest(method, params).pipe(
                           Effect.andThen(client.request(method, params)),
+                          Effect.tap(() => afterRequest(method, params)),
                         ),
                       handleServerNotification: (method, handler) =>
                         client.handleServerNotification(method, (payload) =>
@@ -1301,7 +1305,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       };
       const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
         instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
-        settings: DEFAULT_CODEX_SETTINGS,
+        settings,
+        ...(resolveRuntime === undefined ? {} : { resolveRuntime }),
         environment: {},
         clientFactory,
         ...(onUsageLimits ? { onUsageLimits } : {}),
@@ -1382,6 +1387,897 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         awaitTerminal: (count: number) => changes.until(() => terminalEvents().length >= count),
       };
     });
+
+  it.effect.each([
+    "continued",
+    "retained-limit",
+    "failed",
+    "stop",
+    "stop-fallback",
+    "stop-after-compact",
+    "stop-checking",
+    "stop-checking-next-run",
+    "stop-resuming-next-run",
+    "stop-preparing",
+    "stop-starting",
+    "late-start",
+    "overloaded",
+    "steer",
+    "steer-race",
+  ] as const)("handles automatic image compaction: %s", (outcome) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      const reading = yield* Deferred.make<void>();
+      const releaseRead = yield* Deferred.make<void>();
+      const readingFiber = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const releaseNextCompletion = yield* Deferred.make<void>();
+      const resumed = yield* Deferred.make<ProviderTurnId>();
+      const startsNextRun =
+        outcome === "stop-checking-next-run" || outcome === "stop-resuming-next-run";
+      const stopSent = yield* Deferred.make<void>();
+      const steering = outcome === "steer" || outcome === "steer-race";
+      const stopsCompacting =
+        outcome === "stop" || outcome === "stop-fallback" || outcome === "stop-after-compact";
+      const stopping =
+        stopsCompacting ||
+        outcome === "stop-checking" ||
+        outcome === "stop-checking-next-run" ||
+        outcome === "stop-resuming-next-run" ||
+        outcome === "stop-preparing" ||
+        outcome === "stop-starting";
+      let blockRetainedRead = false;
+      const outboundStarts: Array<unknown> = [];
+      const appContext =
+        outcome === "stop-after-compact" || outcome === "stop-preparing"
+          ? [{ key: "slides", text: "Keep annotations." }]
+          : undefined;
+      const path = `${directory}/rollout.jsonl`;
+      const image = { type: "input_image", image_url: "data:image/png;base64,AA==" };
+      const checkpoint = (count: number) =>
+        fs.writeFileString(
+          path,
+          JSON.stringify({
+            type: "compacted",
+            payload: {
+              replacement_history: [
+                { type: "message", content: Array.from({ length: count }, () => image) },
+              ],
+            },
+          }) + "\n",
+        );
+      yield* checkpoint(38);
+      const nativeThreadId = "image-compaction-thread";
+      const nativeTurnId = "image-compaction-turn";
+      const steerText = { type: "text", text: "Inspect this slide too." };
+      const preamble = codexReplayPreamble({
+        nativeThreadId,
+        nativeTurnId,
+        prompt: "Inspect slides.",
+      });
+      const threadEntry = preamble[4];
+      assert.isTrue(threadEntry?.type === "emit_inbound" && Predicate.isObject(threadEntry.frame));
+      const threadFrame =
+        threadEntry!.type === "emit_inbound"
+          ? (threadEntry!.frame as { result: { thread: Record<string, unknown> } })
+          : undefined;
+      const thread = { ...threadFrame!.result.thread, path };
+      const request = (id: number, method: string, params: unknown, result: unknown = {}) => [
+        { type: "expect_outbound" as const, label: method, frame: { id, method, params } },
+        { type: "emit_inbound" as const, label: method, frame: { id, result } },
+      ];
+      const restoreItems = [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "<external_slides>Keep annotations.</external_slides>" },
+          ],
+        },
+      ];
+      const notification = (method: string, params: unknown, label = method) => ({
+        type: "emit_inbound" as const,
+        label,
+        frame: { method, params },
+      });
+      const terminal = (id: string, status: "completed" | "interrupted" | "failed") =>
+        notification("turn/completed", {
+          threadId: nativeThreadId,
+          turn: {
+            ...makeCodexReplayTurn({ id, status }),
+            ...(status === "failed"
+              ? { error: { message: "At capacity", codexErrorInfo: "serverOverloaded" } }
+              : {}),
+          },
+        });
+      const compact = (id: number, turnId: string, count: number) => [
+        ...request(id, "thread/compact/start", { threadId: nativeThreadId }),
+        notification(
+          "turn/started",
+          {
+            threadId: nativeThreadId,
+            turn: makeCodexReplayTurn({ id: turnId, status: "inProgress" }),
+          },
+          outcome === "late-start" ? "late compact start" : "turn/started",
+        ),
+        notification("item/started", {
+          threadId: nativeThreadId,
+          turnId,
+          item: { type: "contextCompaction", id: turnId },
+        }),
+        notification(
+          "item/completed",
+          { threadId: nativeThreadId, turnId, item: { type: "contextCompaction", id: turnId } },
+          `retained:${count}`,
+        ),
+        terminal(turnId, outcome === "failed" ? "failed" : "completed"),
+      ];
+      const startFrame = preamble[5];
+      assert.isTrue(startFrame?.type === "expect_outbound" && Predicate.isObject(startFrame.frame));
+      const startParams =
+        startFrame!.type === "expect_outbound"
+          ? (startFrame!.frame as { params: Record<string, unknown> })
+          : undefined;
+      if (appContext !== undefined)
+        startParams!.params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+          nativeThreadId,
+          codexInput: [{ type: "text", text: "Inspect slides." }],
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          hasT3Mcp: false,
+          appContext,
+        });
+      const resume = (id: number, turnId: string) => [
+        {
+          type: "expect_outbound" as const,
+          label: "resume",
+          frame: { id, method: "turn/start", params: { ...startParams!.params, input: [] } },
+        },
+        {
+          type: "emit_inbound" as const,
+          label: "resume",
+          frame: {
+            id,
+            result: { turn: makeCodexReplayTurn({ id: turnId, status: "inProgress" }) },
+          },
+        },
+        notification("turn/started", {
+          threadId: nativeThreadId,
+          turn: makeCodexReplayTurn({ id: turnId, status: "inProgress" }),
+        }),
+      ];
+      const transcript = makeCodexReplayTranscript({
+        scenario: "automatic-image-compaction",
+        entries: [
+          ...preamble.slice(0, 5),
+          ...request(3, "thread/read", { threadId: nativeThreadId, includeTurns: false }).slice(
+            0,
+            1,
+          ),
+          { type: "emit_inbound", label: "read", frame: { id: 3, result: { thread } } },
+          ...preamble.slice(5, 7).map((entry) => withReplayRequestId(entry, 4)),
+          ...preamble.slice(7),
+          notification("item/completed", {
+            threadId: nativeThreadId,
+            turnId: nativeTurnId,
+            item: { type: "imageView", id: "view-1", path: "/workspace/slide.png" },
+          }),
+          notification("item/completed", {
+            threadId: nativeThreadId,
+            turnId: nativeTurnId,
+            item: { type: "imageView", id: "view-1", path: "/workspace/slide.png" },
+          }),
+          ...(outcome === "steer"
+            ? []
+            : [
+                notification(
+                  "item/completed",
+                  {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    item: {
+                      type: "mcpToolCall",
+                      id: "browser-1",
+                      server: "browser",
+                      tool: "screenshot",
+                      arguments: {},
+                      status: "completed",
+                      result: { content: [{ type: "image", mimeType: "image/png", data: "AA==" }] },
+                    },
+                  },
+                  "screenshot",
+                ),
+              ]),
+          ...request(5, "turn/interrupt", { threadId: nativeThreadId, turnId: nativeTurnId }),
+          terminal(nativeTurnId, outcome === "overloaded" ? "failed" : "interrupted"),
+          ...(stopsCompacting
+            ? [
+                ...compact(6, "compact-1", 38).slice(0, outcome === "stop-after-compact" ? -1 : 4),
+                ...request(7, "turn/interrupt", {
+                  threadId: nativeThreadId,
+                  turnId: "compact-1",
+                }),
+                ...(outcome === "stop-fallback" ? [] : [terminal("compact-1", "interrupted")]),
+              ]
+            : compact(6, "compact-1", outcome === "retained-limit" ? 40 : 38)),
+          ...(steering
+            ? [
+                ...resume(7, "resume-1"),
+                {
+                  type: "expect_outbound" as const,
+                  label: "steer",
+                  frame: {
+                    id: 8,
+                    method: "turn/steer",
+                    params: {
+                      threadId: nativeThreadId,
+                      expectedTurnId: "resume-1",
+                      input: [steerText, { type: "image", url: image.image_url }],
+                    },
+                  },
+                },
+                {
+                  type: "emit_inbound" as const,
+                  label: "steer",
+                  frame: { id: 8, result: { turnId: "resume-1" } },
+                },
+                terminal("resume-1", "completed"),
+              ]
+            : []),
+          ...(outcome === "overloaded"
+            ? [...resume(7, "resume-1"), terminal("resume-1", "completed")]
+            : []),
+          ...(outcome === "late-start"
+            ? request(
+                7,
+                "thread/unsubscribe",
+                { threadId: nativeThreadId },
+                { status: "unsubscribed" },
+              )
+            : []),
+          ...(outcome === "stop-preparing"
+            ? request(7, "thread/inject_items", { threadId: nativeThreadId, items: restoreItems })
+            : []),
+          ...(outcome === "stop-starting"
+            ? [
+                ...resume(7, "resume-1"),
+                ...request(8, "turn/interrupt", { threadId: nativeThreadId, turnId: "resume-1" }),
+                terminal("resume-1", "interrupted"),
+              ]
+            : []),
+          ...(outcome === "stop-resuming-next-run"
+            ? [
+                resume(7, "resume-1")[0]!,
+                resume(7, "resume-1")[2]!,
+                ...request(8, "turn/interrupt", { threadId: nativeThreadId, turnId: "resume-1" }),
+                terminal("resume-1", "interrupted"),
+              ]
+            : []),
+          ...(outcome === "stop-after-compact"
+            ? [
+                {
+                  type: "expect_outbound" as const,
+                  frame: {
+                    id: 8,
+                    method: "thread/read",
+                    params: { threadId: nativeThreadId, includeTurns: false },
+                  },
+                },
+                { type: "emit_inbound" as const, frame: { id: 8, result: { thread } } },
+                ...request(9, "thread/inject_items", {
+                  threadId: nativeThreadId,
+                  items: [
+                    {
+                      type: "message",
+                      role: "user",
+                      content: [
+                        {
+                          type: "input_text",
+                          text: "<external_slides>Keep annotations.</external_slides>",
+                        },
+                      ],
+                    },
+                  ],
+                }),
+                ...resume(10, "after-stop"),
+                terminal("after-stop", "completed"),
+              ]
+            : []),
+          ...(startsNextRun
+            ? [
+                ...request(
+                  outcome === "stop-checking-next-run" ? 7 : 9,
+                  "thread/read",
+                  { threadId: nativeThreadId, includeTurns: false },
+                  { thread },
+                ),
+                ...compact(outcome === "stop-checking-next-run" ? 8 : 10, "compact-2", 2).slice(
+                  0,
+                  -1,
+                ),
+                ...(outcome === "stop-resuming-next-run"
+                  ? [{ ...resume(7, "resume-1")[1]!, label: "old resume ACK" }]
+                  : []),
+                { ...terminal("compact-2", "completed"), label: "next completion" },
+                ...resume(outcome === "stop-checking-next-run" ? 9 : 11, "after-stop"),
+                terminal("after-stop", "completed"),
+              ]
+            : []),
+          ...(outcome === "continued"
+            ? [
+                ...resume(7, "resume-1"),
+                notification("item/completed", {
+                  threadId: nativeThreadId,
+                  turnId: "resume-1",
+                  item: {
+                    type: "functionCallOutput",
+                    id: "batch-2",
+                    name: "functions",
+                    output: [image, image],
+                  },
+                }),
+                ...request(8, "turn/interrupt", { threadId: nativeThreadId, turnId: "resume-1" }),
+                terminal("resume-1", "interrupted"),
+                ...compact(9, "compact-2", 2),
+                ...resume(10, "resume-2"),
+                terminal("resume-2", "completed"),
+              ]
+            : []),
+        ],
+      });
+      const compacting = yield* Deferred.make<ProviderTurnId>();
+      const compacted = yield* Deferred.make<ProviderTurnId>();
+      const viewed = yield* Deferred.make<ProviderTurnId>();
+      const harness = yield* makeCodexReplayHarness(
+        transcript,
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.viewedImagePath !== undefined
+            ? Deferred.succeed(viewed, event.turnItem.providerTurnId!)
+            : event.type === "provider_turn.updated" &&
+                event.providerTurn.nativeTurnRef?.nativeId === "resume-1" &&
+                event.providerTurn.status === "running"
+              ? Deferred.succeed(resumed, event.providerTurn.id)
+              : event.type === "provider_turn.updated" &&
+                  event.providerTurn.nativeTurnRef?.nativeId === "compact-1" &&
+                  event.providerTurn.status === "running"
+                ? Deferred.succeed(compacting, event.providerTurn.id)
+                : event.type === "turn_item.updated" &&
+                    event.turnItem.type === "compaction" &&
+                    event.turnItem.status === "completed"
+                  ? Deferred.succeed(compacted, event.turnItem.providerTurnId!)
+                  : Effect.void,
+        (method, params) =>
+          Effect.sync(() => {
+            if (method === "turn/start") outboundStarts.push(params);
+          }).pipe(
+            Effect.andThen(
+              Effect.withFiber((fiber) =>
+                outcome === "stop-resuming-next-run" &&
+                method === "turn/start" &&
+                outboundStarts.length === 2
+                  ? Deferred.succeed(readingFiber, fiber)
+                  : Effect.void,
+              ),
+            ),
+          ),
+        undefined,
+        (entry) =>
+          entry.label?.startsWith("retained:")
+            ? checkpoint(Number(entry.label.slice(9))).pipe(
+                Effect.orDie,
+                Effect.andThen(
+                  Effect.sync(() => {
+                    blockRetainedRead =
+                      outcome === "stop-checking" ||
+                      (outcome === "stop-checking-next-run" && entry.label === "retained:38");
+                  }),
+                ),
+              )
+            : entry.label === "old resume ACK"
+              ? Deferred.await(releaseRead)
+              : entry.label === "next completion"
+                ? Deferred.await(releaseNextCompletion)
+                : entry.label === "late compact start"
+                  ? TestClock.adjust("10 seconds")
+                  : entry.label === "thread/inject_items" &&
+                      outcome === "stop-preparing" &&
+                      entry.type === "emit_inbound"
+                    ? Deferred.succeed(reading, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseRead)),
+                      )
+                    : entry.label === "resume" &&
+                        outcome === "stop-starting" &&
+                        entry.type === "emit_inbound"
+                      ? Deferred.succeed(reading, undefined).pipe(
+                          Effect.andThen(Deferred.await(releaseRead)),
+                        )
+                      : entry.label === "screenshot" && outcome === "steer-race"
+                        ? Deferred.await(reading)
+                        : Effect.void,
+        undefined,
+        undefined,
+        undefined,
+        outcome === "continued"
+          ? DEFAULT_CODEX_SETTINGS
+          : { ...DEFAULT_CODEX_SETTINGS, autoCompactImages: true },
+        outcome === "continued"
+          ? Effect.succeed({
+              revision: "image-test-runtime",
+              config: { ...DEFAULT_CODEX_SETTINGS, autoCompactImages: true },
+              environment: {},
+            })
+          : undefined,
+        (method, params) =>
+          method === "turn/interrupt" && Predicate.isObject(params) && params.turnId === "compact-1"
+            ? Deferred.succeed(stopSent, undefined)
+            : Effect.void,
+      ).pipe(
+        Effect.provideService(FileSystem.FileSystem, {
+          ...fs,
+          open: (filePath, options) =>
+            blockRetainedRead && filePath === path
+              ? Effect.withFiber((fiber) => Deferred.succeed(readingFiber, fiber)).pipe(
+                  Effect.andThen(Deferred.succeed(reading, undefined)),
+                  Effect.andThen(Deferred.await(releaseRead)),
+                  Effect.andThen(fs.open(filePath, options)),
+                )
+              : fs.open(filePath, options),
+          readFile: (filePath) =>
+            outcome === "steer-race" && filePath.endsWith("-png.png")
+              ? Deferred.succeed(reading, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRead)),
+                  Effect.andThen(fs.readFile(filePath)),
+                )
+              : fs.readFile(filePath),
+        }),
+      );
+      const turnInput = {
+        ...makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("image-compaction-attempt"),
+          text: "Inspect slides.",
+        }),
+        ...(appContext === undefined ? {} : { appContext }),
+      };
+      yield* harness.runtime.startTurn(turnInput);
+      if (steering) {
+        const attachment = {
+          type: "image" as const,
+          id: "steer-00000000-0000-4000-8000-000000000001-png",
+          name: "slide.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+        };
+        const attachmentPath = `${harness.serverConfig.attachmentsDir}/${attachment.id}.png`;
+        yield* fs.makeDirectory(harness.serverConfig.attachmentsDir, { recursive: true });
+        yield* fs.writeFile(attachmentPath, new Uint8Array([0]));
+        steerText.text += `\n\n[Attached image "slide.png" is saved at: ${attachmentPath}]`;
+        const steer = harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: turnInput.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: yield* Deferred.await(viewed),
+          modelSelection: turnInput.modelSelection,
+          message: {
+            ...turnInput.message,
+            text: "Inspect this slide too.",
+            attachments: [attachment],
+          },
+        });
+        if (outcome === "steer-race") {
+          const fiber = yield* steer.pipe(Effect.forkScoped);
+          yield* Deferred.await(compacting);
+          yield* Deferred.succeed(releaseRead, undefined);
+          yield* Fiber.join(fiber);
+        } else yield* steer;
+      }
+      if (stopping) {
+        const providerTurnId = yield* Deferred.await(
+          outcome === "stop-resuming-next-run"
+            ? resumed
+            : outcome === "stop-after-compact" ||
+                outcome === "stop-checking" ||
+                outcome === "stop-checking-next-run" ||
+                outcome === "stop-preparing" ||
+                outcome === "stop-starting"
+              ? compacted
+              : compacting,
+        );
+        const stop = harness.runtime.interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId,
+        });
+        if (
+          outcome === "stop-checking" ||
+          outcome === "stop-checking-next-run" ||
+          outcome === "stop-preparing" ||
+          outcome === "stop-starting"
+        ) {
+          yield* Deferred.await(reading);
+          const fiber = yield* stop.pipe(Effect.forkScoped({ startImmediately: true }));
+          if (outcome === "stop-checking-next-run") yield* TestClock.adjust("10 seconds");
+          else yield* Deferred.succeed(releaseRead, undefined);
+          yield* Fiber.join(fiber);
+        } else if (outcome === "stop-fallback") {
+          const pendingSteer = yield* harness.runtime
+            .steerTurn({
+              threadId: harness.threadId,
+              runId: turnInput.runId,
+              providerThread: harness.providerThread,
+              providerTurnId,
+              message: turnInput.message,
+            })
+            .pipe(Effect.forkScoped);
+          const fiber = yield* stop.pipe(Effect.forkScoped);
+          yield* Deferred.await(stopSent);
+          yield* TestClock.adjust("10 seconds");
+          yield* Fiber.join(fiber);
+          assert.isTrue(Exit.isFailure(yield* Fiber.await(pendingSteer)));
+        } else yield* stop;
+      }
+      if (outcome === "failed") {
+        yield* harness.until(
+          () =>
+            harness.terminalEvents().length > 0 ||
+            harness.events.some(
+              (event) =>
+                event.type === "turn_item.updated" &&
+                event.turnItem.type === "error" &&
+                event.turnItem.status === "running",
+            ),
+        );
+      } else yield* harness.firstTerminal;
+      if (outcome === "late-start")
+        yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+      assert.deepEqual(
+        harness.terminalEvents().map((event) => event.status),
+        [
+          outcome === "continued" || steering || outcome === "overloaded"
+            ? "completed"
+            : stopping
+              ? "interrupted"
+              : "failed",
+        ],
+        JSON.stringify(harness.terminalEvents()),
+      );
+      const turns = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated" && event.providerTurn.status === "running"
+          ? [event.providerTurn]
+          : [],
+      );
+      assert.deepEqual(
+        turns.map((turn) => turn.ordinal),
+        outcome === "continued"
+          ? [1, 2, 3, 4, 5]
+          : steering ||
+              outcome === "overloaded" ||
+              outcome === "stop-starting" ||
+              outcome === "stop-resuming-next-run"
+            ? [1, 2, 3]
+            : outcome === "late-start"
+              ? [1]
+              : [1, 2],
+      );
+      assert.equal(new Set(turns.map((turn) => turn.runAttemptId)).size, 1);
+      assert.deepEqual(
+        harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+            ? [event.turnItem.status]
+            : [],
+        ),
+        outcome === "continued"
+          ? ["running", "completed", "running", "completed"]
+          : stopsCompacting && outcome !== "stop-after-compact"
+            ? ["running", "interrupted"]
+            : outcome === "late-start"
+              ? []
+              : ["running", "completed"],
+      );
+      if (outcome === "stop-preparing") assert.lengthOf(outboundStarts, 1);
+      if (outcome === "stop-after-compact" || startsNextRun) {
+        if (startsNextRun) {
+          blockRetainedRead = false;
+          yield* checkpoint(40);
+        }
+        yield* harness.runtime.startTurn({
+          ...turnInput,
+          runId: RunId.make("image-context-next"),
+          attemptId: RunAttemptId.make("image-context-next"),
+          restartContinuationOfRunId: turnInput.runId,
+        });
+        if (startsNextRun) {
+          yield* harness.until(() =>
+            harness.events.some(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.nativeTurnRef?.nativeId === "compact-2" &&
+                event.providerTurn.status === "running",
+            ),
+          );
+          yield* Deferred.succeed(releaseRead, undefined);
+          yield* Fiber.await(yield* Deferred.await(readingFiber));
+          yield* Deferred.succeed(releaseNextCompletion, undefined);
+        }
+        yield* harness.awaitTerminal(2);
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => event.status),
+          ["interrupted", "completed"],
+        );
+        if (startsNextRun)
+          assert.isTrue(
+            harness.events.some(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.providerTurn.nativeTurnRef?.nativeId === "after-stop" &&
+                event.providerTurn.status === "running",
+            ),
+          );
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each(["continued", "fresh", "unreadable", "too-many"] as const)(
+    "checks attached images before delivery: %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const directory = yield* fs.makeTempDirectoryScoped();
+        const path = `${directory}/rollout.jsonl`;
+        const image = { type: "input_image", image_url: "data:image/png;base64,AA==" };
+        const checkpoint = (count: number) =>
+          fs.writeFileString(
+            path,
+            JSON.stringify({
+              type: "compacted",
+              payload: {
+                replacement_history: [
+                  { type: "message", content: Array.from({ length: count }, () => image) },
+                ],
+              },
+            }) + "\n",
+          );
+        if (outcome === "continued") yield* checkpoint(39);
+        if (outcome === "unreadable") yield* fs.writeFileString(path, "invalid rollout\n");
+        const nativeThreadId = "attached-images-thread";
+        const nativeTurnId = "attached-images-turn";
+        const preamble = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId,
+          prompt: "Inspect this slide.",
+        });
+        const threadFrame =
+          preamble[4]?.type === "emit_inbound"
+            ? (preamble[4].frame as { result: { thread: Record<string, unknown> } })
+            : undefined;
+        const startFrame =
+          preamble[5]?.type === "expect_outbound"
+            ? (preamble[5].frame as { params: Record<string, unknown> })
+            : undefined;
+        const thread = { ...threadFrame!.result.thread, path };
+        const expectedText = { type: "text", text: "Inspect this slide." };
+        const transcript = makeCodexReplayTranscript({
+          scenario: `image-preflight-${outcome}`,
+          entries: [
+            ...preamble.slice(0, 5),
+            ...(outcome === "too-many"
+              ? []
+              : [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "read",
+                    frame: {
+                      id: 3,
+                      method: "thread/read",
+                      params: { threadId: nativeThreadId, includeTurns: false },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "read",
+                    frame: { id: 3, result: { thread } },
+                  },
+                ]),
+            ...(outcome === "fresh"
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "input",
+                    frame: {
+                      id: 4,
+                      method: "turn/start",
+                      params: {
+                        ...startFrame!.params,
+                        input: [expectedText, { type: "image", url: image.image_url }],
+                      },
+                    },
+                  },
+                  ...preamble.slice(6, 7).map((entry) => withReplayRequestId(entry, 4)),
+                  ...preamble.slice(7),
+                  {
+                    type: "emit_inbound" as const,
+                    label: "completed",
+                    frame: {
+                      method: "turn/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                      },
+                    },
+                  },
+                  {
+                    type: "expect_outbound" as const,
+                    label: "read existing missing rollout",
+                    frame: {
+                      id: 5,
+                      method: "thread/read",
+                      params: { threadId: nativeThreadId, includeTurns: false },
+                    },
+                  },
+                  { type: "emit_inbound" as const, frame: { id: 5, result: { thread } } },
+                ]
+              : []),
+            ...(outcome === "continued"
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "compact",
+                    frame: {
+                      id: 4,
+                      method: "thread/compact/start",
+                      params: { threadId: nativeThreadId },
+                    },
+                  },
+                  { type: "emit_inbound" as const, label: "compact", frame: { id: 4, result: {} } },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "compact started",
+                    frame: {
+                      method: "turn/started",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({
+                          id: "preflight-compact",
+                          status: "inProgress",
+                        }),
+                      },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "retained",
+                    frame: {
+                      method: "item/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turnId: "preflight-compact",
+                        item: { type: "contextCompaction", id: "preflight-compact" },
+                      },
+                    },
+                  },
+                  {
+                    type: "emit_inbound" as const,
+                    label: "compact completed",
+                    frame: {
+                      method: "turn/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: "preflight-compact", status: "completed" }),
+                      },
+                    },
+                  },
+                  {
+                    type: "expect_outbound" as const,
+                    label: "input",
+                    frame: {
+                      id: 5,
+                      method: "turn/start",
+                      params: {
+                        ...startFrame!.params,
+                        input: [expectedText, { type: "image", url: image.image_url }],
+                      },
+                    },
+                  },
+                  ...preamble.slice(6, 7).map((entry) => withReplayRequestId(entry, 5)),
+                  ...preamble.slice(7),
+                  {
+                    type: "emit_inbound" as const,
+                    label: "completed",
+                    frame: {
+                      method: "turn/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                      },
+                    },
+                  },
+                ]
+              : []),
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          undefined,
+          undefined,
+          undefined,
+          (entry) => (entry.label === "retained" ? checkpoint(1).pipe(Effect.orDie) : Effect.void),
+          undefined,
+          undefined,
+          undefined,
+          { ...DEFAULT_CODEX_SETTINGS, autoCompactImages: true },
+        );
+        const attachment = {
+          type: "image" as const,
+          id: "image-00000000-0000-4000-8000-000000000001-png",
+          name: "slide.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+        };
+        yield* fs.makeDirectory(harness.serverConfig.attachmentsDir, { recursive: true });
+        const attachmentPath = `${harness.serverConfig.attachmentsDir}/${attachment.id}.png`;
+        yield* fs.writeFile(attachmentPath, new Uint8Array([0]));
+        expectedText.text += `\n\n[Attached image "slide.png" is saved at: ${attachmentPath}]`;
+        const turnInput = makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make(`image-preflight-${outcome}`),
+          text: "Inspect this slide.",
+        });
+        const start = harness.runtime.startTurn({
+          ...turnInput,
+          message: {
+            ...turnInput.message,
+            attachments: Array.from({ length: outcome === "too-many" ? 40 : 1 }, () => attachment),
+          },
+        });
+        if (outcome === "continued" || outcome === "fresh") {
+          yield* start;
+          yield* harness.firstTerminal;
+          assert.deepEqual(
+            harness.terminalEvents().map((event) => event.status),
+            ["completed"],
+            JSON.stringify(harness.terminalEvents()),
+          );
+          if (outcome === "fresh") {
+            const error = yield* Effect.flip(harness.runtime.startTurn(turnInput));
+            assert.equal(error._tag, "ProviderAdapterTurnStartError");
+            assert.instanceOf(error.cause, ProviderAdapter.ProviderAdapterProtocolError);
+          }
+        } else {
+          const error = yield* Effect.flip(start);
+          assert.equal(error._tag, "ProviderAdapterTurnStartError");
+          assert.instanceOf(error.cause, ProviderAdapter.ProviderAdapterProtocolError);
+          assert.include(
+            (error.cause as ProviderAdapter.ProviderAdapterProtocolError).detail,
+            outcome === "too-many" ? "fewer than 40" : "Could not read Codex",
+          );
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
 
   it.effect("keeps native image views available to the clients", () =>
     Effect.gen(function* () {

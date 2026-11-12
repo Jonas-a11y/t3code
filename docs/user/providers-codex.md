@@ -100,6 +100,19 @@ in the thread on web, desktop, or mobile. Some tools offer access for one reques
 the current session, or permanently. See [Permission modes](./permission-modes.md)
 for command and file approvals.
 
+## Automatic image compaction (experimental)
+
+For long tasks involving screenshots or slide images, enable **Automatic image
+compaction (experimental)** in **Settings → Providers** on web or desktop for your Codex instance,
+then start a new thread. T3 Code interrupts at 40 images, compacts the context,
+and continues the same task. Attached images also count toward the threshold.
+
+This can reduce image-limit failures, but a large tool result can exceed the
+limit before T3 Code can interrupt. Compaction can also retain images; if too
+many remain, the task stops with an explanation. Stop cancels automatic
+continuation. The experiment is off by default and does not cover Codex's
+native goals or internal subagents.
+
 ## Codex says I hit a usage limit
 
 When Codex stops on a usage limit, the thread names the window that ran out and
