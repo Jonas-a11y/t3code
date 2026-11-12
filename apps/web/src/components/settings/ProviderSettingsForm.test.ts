@@ -5,6 +5,7 @@ import {
   SettingsSecretValue,
   TrimmedString,
 } from "@t3tools/contracts";
+import { CodexSettings } from "@t3tools/contracts/settings";
 import * as Schema from "effect/Schema";
 
 import { providerClients } from "./providerDriverMeta";
@@ -14,6 +15,8 @@ import {
   reconcileRowsDraft,
   seedRowsDraft,
 } from "./ProviderSettingsForm";
+
+const decodeCodexSettings = Schema.decodeUnknownSync(CodexSettings);
 
 describe("ProviderSettingsForm helpers", () => {
   it("keeps every masked field as a stored secret and offers a reference only where typed so", () => {
@@ -52,7 +55,7 @@ describe("ProviderSettingsForm helpers", () => {
     expect(next).toEqual({ forkOwned: 1 });
   });
 
-  it("stores false boolean fields when true is the default", () => {
+  it("stores boolean settings with non-default values", () => {
     const next = nextProviderConfigWithFieldValue(
       undefined,
       {
@@ -66,6 +69,17 @@ describe("ProviderSettingsForm helpers", () => {
     );
 
     expect(next).toEqual({ experimental: false });
+
+    const codex = providerClients.get(ProviderDriverKind.make("codex"));
+    expect(codex).toBeDefined();
+    const imageCompaction = deriveProviderSettingsFields(codex!).find(
+      (field) => field.key === "autoCompactImages",
+    );
+    expect(imageCompaction).toMatchObject({ control: "switch", defaultBooleanValue: false });
+    const enabled = nextProviderConfigWithFieldValue(undefined, imageCompaction!, true);
+    expect(decodeCodexSettings(enabled).autoCompactImages).toBe(true);
+    const disabled = nextProviderConfigWithFieldValue(enabled, imageCompaction!, false);
+    expect(decodeCodexSettings(disabled ?? {}).autoCompactImages).toBe(false);
   });
 });
 
