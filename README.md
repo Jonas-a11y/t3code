@@ -1,5 +1,31 @@
 # T3 Code
 
+## Managed local fork
+
+This fork develops a managed local distribution on the `managed-local` branch. It is a technical
+candidate for organizational review; deployment approval has not been established.
+
+- The example machine policy permits desktop and local browser clients, disables Connect, product
+  telemetry, OTLP export, webhooks, cookie import, agent browser access, and automatic updates,
+  and restricts provider binaries and permission modes.
+- The fork adds `limits.otlpExport: false` to stop server and desktop diagnostic exports, browser
+  trace forwarding, and endpoint checks regardless of user-configured export targets.
+- As of November 12, 2026, regression tests, changed-file checks, and an isolated source-server
+  collector test pass. A macOS arm64 candidate was built and its package integrity checked.
+- Installed machine-policy enforcement, managed model-gateway routing, and full desktop/agent
+  network behavior remain to be verified. The candidate has no Developer ID signing or
+  notarization and retains the upstream app identity.
+
+Use the [managed local distribution guide](./docs/operations/managed-local-distribution.md) and
+its [review checklist](./docs/operations/managed-local-distribution.md#candidate-status-and-review-checklist)
+to prepare a deployment. The [example policy](./docs/operations/examples/managed-local-policy.json)
+requires real managed agent paths and machine-wide provisioning; a missing policy leaves T3
+unmanaged. This profile does not provide an operating-system sandbox or a complete network
+allowlist.
+
+The installation commands below describe upstream T3 Code and do not install this managed
+candidate or provision its policy.
+
 T3 Code is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).
 
 Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, Google Antigravity, and fx. If they're set up on your computer, T3 Code can control them.

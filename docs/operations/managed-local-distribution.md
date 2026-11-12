@@ -5,6 +5,29 @@ remote clients, T3 Connect, product telemetry, or OTLP export. It is a technical
 candidate, not an organizational approval or a sandbox. Keep mobile and hosted web applications
 out of this deployment.
 
+## Candidate status and review checklist
+
+Status as of November 12, 2026: the OTLP guard has regression tests, changed-file checks pass,
+and an isolated source server produced no collector requests while export targets were set.
+A macOS arm64 candidate was built; bundle self-containment and DMG/ZIP integrity checks pass.
+These checks do not establish installed-policy enforcement, complete network behavior, or
+organizational approval. The following work remains for a deployment review:
+
+| Work item                        | Evidence to prepare                                                                                                                                                            | Current status                                                                      |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| Scope and assessment findings    | Define supported platform, clients, providers, data classes, trust boundaries, and a disposition for each assessment finding. Confirm the review body's acceptance criteria.   | Open; proposed scope is macOS arm64, desktop and local browser only.                |
+| Actual machine policy            | Replace example values, provision an administrator-protected policy, record its fingerprint, and demonstrate that deployment controls prevent unmanaged launch or replacement. | Example exists; real provisioning and enforcement tests are open.                   |
+| Managed agent runtimes           | Pin CLI versions and configuration, protect credentials, define tool permissions and approved destinations, and prove model routing during a synthetic turn.                   | Profile locks T3 provider fields; runtime configuration and routing proof are open. |
+| Installed-package verification   | Execute the matrix below on an isolated machine, including negative cases, and retain sanitized network observations for desktop, server, renderer, and agents.                | Source-level evidence exists; full package exercise is open.                        |
+| Release provenance and licensing | Record the exact commit, lockfile and artifact hashes, dependency inventory, license notices, and vulnerability findings with their disposition.                               | Candidate and hashes exist; inventory and assessment are open.                      |
+| Signing and distribution         | Resolve app identity and policy domain, produce signed/notarized macOS artifacts, and define a controlled delivery path.                                                       | Candidate retains upstream identity and has only an ad-hoc signature.               |
+| Operations and review submission | Assign update, gateway, signing, policy, retention, incident, and rollback owners; assemble the evidence and clearly identify remaining limitations.                           | Open.                                                                               |
+
+An early assessment can discuss these gaps before rollout work is complete. The reviewing
+organization determines which evidence is required for a limited trial or broader deployment.
+Keep organization-specific policies, infrastructure, credentials, and raw evidence outside a
+public fork; publish only generic configuration and sanitized technical results.
+
 ## Prepare the policy and agent runtimes
 
 Copy [managed-local-policy.json](./examples/managed-local-policy.json) into your deployment
