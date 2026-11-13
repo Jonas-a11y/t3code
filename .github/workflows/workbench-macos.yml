@@ -66,6 +66,13 @@ jobs:
           set -euo pipefail
           test -n "$SIGNING_CERTIFICATE"
           test -n "$SIGNING_PASSWORD"
+          IFS=/ read -r workbench_owner workbench_repo <<< "$T3CODE_DESKTOP_UPDATE_REPOSITORY"
+          cat > "release/mac-arm64/Local Code Workbench (Beta).app/Contents/Resources/app-update.yml" <<YAML
+          provider: github
+          owner: $workbench_owner
+          repo: $workbench_repo
+          updaterCacheDirName: local-code-workbench-updater
+          YAML
           keychain="$RUNNER_TEMP/workbench-signing.keychain-db"
           trap 'security delete-keychain "$keychain"' EXIT
           printf '%s' "$SIGNING_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/workbench-signing.p12"
