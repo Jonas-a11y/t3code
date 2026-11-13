@@ -72,7 +72,8 @@ jobs:
           security create-keychain -p "$SIGNING_PASSWORD" "$keychain"
           security unlock-keychain -p "$SIGNING_PASSWORD" "$keychain"
           security import "$RUNNER_TEMP/workbench-signing.p12" -k "$keychain" -P "$SIGNING_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$SIGNING_PASSWORD" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple: -k "$SIGNING_PASSWORD" "$keychain" > /dev/null
           codesign --force --sign "Local Code Workbench Updates" --keychain "$keychain" --timestamp=none --preserve-metadata=entitlements "release/mac-arm64/Local Code Workbench (Beta).app"
           codesign --verify --deep --strict "release/mac-arm64/Local Code Workbench (Beta).app"
 
