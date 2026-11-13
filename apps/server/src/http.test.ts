@@ -97,7 +97,32 @@ describe("MCP app asset responses", () => {
 });
 
 describe("browser API CORS", () => {
-  it("accepts protocol negotiation with authenticated browser headers", async () => {
+  it.each([
+    {
+      name: "production browser",
+      dev: false,
+      origin: "https://app.t3.codes",
+      allowed: "*",
+    },
+    {
+      name: "fork desktop",
+      dev: true,
+      origin: "t3code-workbench://app",
+      allowed: "t3code-workbench://app",
+    },
+    {
+      name: "fork development desktop",
+      dev: true,
+      origin: "t3code-workbenchdev://app",
+      allowed: "t3code-workbenchdev://app",
+    },
+    {
+      name: "unrelated desktop",
+      dev: true,
+      origin: "t3code-unrelated://app",
+      allowed: null,
+    },
+  ])("uses CORS for $name", async ({ dev, origin, allowed }) => {
     const layerRoute = Layer.effectDiscard(
       Effect.gen(function* () {
         const router = yield* HttpRouter.HttpRouter;
@@ -105,6 +130,10 @@ describe("browser API CORS", () => {
       }),
     );
     const layerApp = Layer.merge(layerRoute, ServerHttp.layerBrowserApiCors).pipe(
+      Layer.updateService(ServerConfig.ServerConfig, (config) => ({
+        ...config,
+        devUrl: dev ? new URL("http://localhost:5173") : undefined,
+      })),
       Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "http-cors-test-" })),
       Layer.provide(NodeServices.layer),
     );
@@ -115,7 +144,7 @@ describe("browser API CORS", () => {
         new Request("https://backend.example/api/environment", {
           method: "OPTIONS",
           headers: {
-            origin: "https://app.t3.codes",
+            origin,
             "access-control-request-method": "GET",
             "access-control-request-headers": [
               ORCHESTRATION_PROTOCOL_HEADER,
@@ -127,7 +156,8 @@ describe("browser API CORS", () => {
       );
 
       expect(response.status).toBe(204);
-      expect(response.headers.get("access-control-allow-origin")).toBe("*");
+      expect(response.headers.get("access-control-allow-origin")).toBe(allowed);
+      if (allowed === null) return;
       const allowedHeaders = new Set(
         (response.headers.get("access-control-allow-headers") ?? "")
           .split(",")

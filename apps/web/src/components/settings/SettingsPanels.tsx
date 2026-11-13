@@ -30,7 +30,12 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { resolvePastedPath } from "@t3tools/shared/path";
 import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
-import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../../branding";
+import {
+  APP_BASE_NAME,
+  APP_VERSION,
+  HOSTED_APP_CHANNEL,
+  HOSTED_APP_CHANNEL_LABEL,
+} from "../../branding";
 import { AboutVersionTitle } from "./AboutVersionTitle";
 import { CliCommandSettingsRow } from "./CliCommandSettingsRow";
 import { MobileAppSettingsRow } from "./MobileAppSettingsRow";
@@ -2129,6 +2134,25 @@ export function AboutSettingsPanel() {
   return (
     <SettingsPageContainer>
       <SettingsSection id="about" title="App">
+        <SettingsRow
+          title={APP_BASE_NAME}
+          description="An independent personal fork of T3 Code, distributed under its MIT license."
+          control={
+            <Button
+              render={
+                <a
+                  href="https://github.com/Jonas-a11y/t3code"
+                  target="_blank"
+                  rel="noreferrer noopener"
+                />
+              }
+              size="sm"
+              variant="outline"
+            >
+              Fork source
+            </Button>
+          }
+        />
         {primaryPolicy ? (
           <SettingsRow
             title="Organization"

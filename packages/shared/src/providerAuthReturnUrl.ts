@@ -1,10 +1,14 @@
 import { isLoopbackHost } from "./preview.ts";
+import { FORK_DEVELOPMENT_PROTOCOL, FORK_PROTOCOL } from "./forkIdentity.ts";
 
 export function providerAuthReturnUrl(value: string | undefined): string | undefined {
   if (!value) return undefined;
   try {
     const url = new URL(value);
-    const desktop = ["t3code:", "t3code-dev:"].includes(url.protocol) && url.host === "app";
+    const desktop =
+      ["t3code:", "t3code-dev:", `${FORK_PROTOCOL}:`, `${FORK_DEVELOPMENT_PROTOCOL}:`].includes(
+        url.protocol,
+      ) && url.host === "app";
     const web =
       ["http:", "https:"].includes(url.protocol) &&
       (isLoopbackHost(url.hostname) || url.origin === "https://app.t3.codes");

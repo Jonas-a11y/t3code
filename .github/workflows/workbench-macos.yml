@@ -1,0 +1,137 @@
+name: Workbench macOS Release
+
+on:
+  push:
+    branches: [managed-local]
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "scripts/**"
+      - "native/**"
+      - "package.json"
+      - "pnpm-*.yaml"
+      - "vite.config.ts"
+      - ".github/workflows/workbench-macos.yml"
+      - ".github/actions/setup-ci-deps/**"
+  workflow_dispatch:
+
+concurrency:
+  group: workbench-macos-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'Jonas-a11y/t3code' && github.ref == 'refs/heads/managed-local'
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: Jonas-a11y/t3code
+    steps:
+      - name: Checkout
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
+
+      - uses: ./.github/actions/setup-ci-deps
+
+      - name: Set release version
+        id: version
+        run: |
+          base_version=$(node -p "JSON.parse(require('fs').readFileSync('apps/desktop/package.json')).version")
+          echo "version=${base_version}-workbench.$((GITHUB_RUN_NUMBER + 3))" >> "$GITHUB_OUTPUT"
+
+      - name: Build self-contained macOS app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test "$(uname -m)" = arm64
+          vp run dist:desktop:artifact --platform mac --target dir --arch arm64 --build-version "$VERSION"
+
+      - name: Sign the Workbench app
+        env:
+          SIGNING_CERTIFICATE: ${{ secrets.WORKBENCH_MAC_CERTIFICATE }}
+          SIGNING_PASSWORD: ${{ secrets.WORKBENCH_MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_CERTIFICATE"
+          test -n "$SIGNING_PASSWORD"
+          keychain="$RUNNER_TEMP/workbench-signing.keychain-db"
+          trap 'security delete-keychain "$keychain"' EXIT
+          printf '%s' "$SIGNING_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/workbench-signing.p12"
+          security create-keychain -p "$SIGNING_PASSWORD" "$keychain"
+          security unlock-keychain -p "$SIGNING_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/workbench-signing.p12" -k "$keychain" -P "$SIGNING_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$SIGNING_PASSWORD" "$keychain" > /dev/null
+          codesign --force --sign "Local Code Workbench Updates" --keychain "$keychain" --timestamp=none --preserve-metadata=entitlements "release/mac-arm64/Local Code Workbench (Beta).app"
+          codesign --verify --deep --strict "release/mac-arm64/Local Code Workbench (Beta).app"
+
+      - name: Verify packaged startup
+        run: node scripts/smoke-desktop-app.ts --executable "release/mac-arm64/Local Code Workbench (Beta).app/Contents/MacOS/Local Code Workbench (Beta)"
+
+      - name: Package update and matching source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip_name="Local-Code-Workbench-${VERSION}-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "release/mac-arm64/Local Code Workbench (Beta).app" "release/$zip_name"
+          ZIP_NAME="$zip_name" node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { serializeUpdateManifest } from "./scripts/lib/update-manifest.ts";
+          const bytes = readFileSync(`release/${process.env.ZIP_NAME}`);
+          writeFileSync("release/latest-mac.yml", serializeUpdateManifest({
+            version: process.env.VERSION,
+            releaseDate: new Date().toISOString(),
+            files: [{ url: process.env.ZIP_NAME, sha512: createHash("sha512").update(bytes).digest("base64"), size: bytes.length }],
+            extras: {},
+          }, { platformLabel: "macOS arm64" }));
+          NODE
+          git archive --format=zip --output="release/Source-${GITHUB_SHA}.zip" HEAD
+          shasum -a 256 release/*.zip release/latest-mac.yml > release/SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: workbench-macos-release
+          path: |
+            release/*.zip
+            release/latest-mac.yml
+            release/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: workbench-macos-release
+          path: release
+
+      - name: Publish verified update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft > existing-release; then
+            test "$(cat existing-release)" = true
+          else
+            gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "Local Code Workbench $VERSION" --notes "Personal macOS arm64 build from $GITHUB_SHA. Includes the bundled server and web client. Signed with the Workbench update certificate; no Apple Developer ID or notarization. Update existing Workbench installations through Settings > About."
+          fi
+          gh release upload "$VERSION" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
