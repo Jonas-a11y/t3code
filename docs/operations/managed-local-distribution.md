@@ -40,7 +40,7 @@ configuration. Pin any required gateway environment variables under each driver'
 `limits.providers.instances.environment`; keep credentials out of the policy.
 
 The profile permits only Codex and Claude, caps permission modes at Supervised, disables agent
-browser access, and stops T3's own update flow. The ceiling also prevents users from supplying
+browser access and preview tunnels, and stops T3's own update flow. The ceiling also prevents users from supplying
 their own provider binary, launch arguments, configuration home, or per-instance environment.
 The environment that launches T3 and the agents' own configuration still matter: control shell
 profiles, `PATH`, runtime injection variables, and agent configuration with device management.
@@ -68,7 +68,7 @@ separately configured relay traces are a different exporter.
 vp i --frozen-lockfile
 vp run check:changed
 T3CODE_TELEMETRY_CHANNEL=stable vp run dist:desktop:artifact \
-  --platform mac --target dmg --arch arm64 --build-version 0.1.9-local.1 \
+  --platform mac --target dmg --arch arm64 --build-version 0.1.11-local.1 \
   --output-dir release/managed-local
 ```
 
