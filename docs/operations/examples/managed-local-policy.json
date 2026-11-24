@@ -10,6 +10,7 @@
     "connect": false,
     "telemetry": false,
     "otlpExport": false,
+    "previewTunnel": false,
     "webhookTasks": false,
     "browserCookieImport": false,
     "providers": {

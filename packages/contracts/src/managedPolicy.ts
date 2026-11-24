@@ -83,6 +83,8 @@ export const ManagedPolicyLimits = Schema.Struct({
   /** `false` stops server and desktop OTLP export, including browser trace forwarding. */
   otlpExport: Schema.optionalKey(Schema.Boolean),
   browserCookieImport: Schema.optionalKey(Schema.Boolean),
+  /** `false` turns the preview tunnel off: no client reaches this machine's loopback ports. */
+  previewTunnel: Schema.optionalKey(Schema.Boolean),
   providers: Schema.optionalKey(ManagedProviderLimits),
   updates: Schema.optionalKey(ManagedUpdatesPolicy),
 });
@@ -98,6 +100,7 @@ export const ManagedPolicySummaryLimits = Schema.Struct({
   telemetry: Schema.optionalKey(Schema.Boolean),
   otlpExport: Schema.optionalKey(Schema.Boolean),
   browserCookieImport: Schema.optionalKey(Schema.Boolean),
+  previewTunnel: Schema.optionalKey(Schema.Boolean),
   providers: Schema.optionalKey(
     Schema.Struct({
       /** Absent means every driver is allowed. */
@@ -213,6 +216,7 @@ const CAPABILITY_LABELS = {
   otlpExport: "OTLP export",
   webhookTasks: "webhook tasks",
   browserCookieImport: "importing browser cookies",
+  previewTunnel: "opening this machine's local servers on other devices",
 } as const;
 
 /** Why a capability is unavailable on an environment with `summary`, or undefined when allowed. */
@@ -229,6 +233,16 @@ export function managedCapabilityDenial(
   return denied
     ? managedPolicyDeniedMessage(summary.organization, CAPABILITY_LABELS[capability])
     : undefined;
+}
+
+/** Whether the preview tunnel serves: the setting is on and no policy switches it off. */
+export function allowsPreviewTunnel(config: {
+  readonly settings: { readonly enablePreviewTunnel: boolean };
+  readonly managedPolicy?: ManagedPolicySummary | undefined;
+}): boolean {
+  return (
+    config.settings.enablePreviewTunnel && config.managedPolicy?.limits?.previewTunnel !== false
+  );
 }
 
 /** Whether the policy lets `driver` run; clients name it with their own provider label. */

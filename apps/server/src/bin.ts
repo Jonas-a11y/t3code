@@ -30,6 +30,8 @@ async function loadCliMain(): Promise<typeof import("./binMain.ts")> {
   }
 }
 
+function ignoreOutputError(): void {}
+
 if (
   isEntrypoint({
     moduleUrl: import.meta.url,
@@ -37,6 +39,12 @@ if (
     runtimeMain: import.meta.main,
   })
 ) {
+  // Logs go to stdout and stderr, which may be a closed desktop launcher pipe or a log file on
+  // a full disk. Node emits a failed write as an unhandled stream error that crashes the process
+  // and skips shutdown, so drop the line instead.
+  process.stdout.on("error", ignoreOutputError);
+  process.stderr.on("error", ignoreOutputError);
+
   // The launcher owns shutdown until its child exits, so it bypasses the Effect CLI runtime.
   // A service unit passes nothing, or on Windows the launcher's own flags; help and anything
   // else go through the full CLI.
@@ -45,6 +53,10 @@ if (
   const launcherOptions = launcher?.parseServiceLauncherArgs(process.argv.slice(3));
   if (launcher !== undefined && launcherOptions !== undefined) {
     await launcher.runServiceLauncherCli(launcherOptions);
+  } else if (process.argv[2] === "__process-launcher") {
+    // Single executables host the launcher here; other builds start process-launcher.mjs directly.
+    const { runProcessLauncher } = await import("./process/processLauncherWorker.ts");
+    runProcessLauncher();
   } else {
     const { runCliCommand } = await loadCliMain();
     await runCliCommand();
