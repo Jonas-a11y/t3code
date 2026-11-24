@@ -950,6 +950,7 @@ it.live.each([
     Effect.gen(function* () {
       const services = Layer.mergeAll(
         layerUnusedConfigRpcServices,
+        ManagedPolicy.layerTest(),
         Layer.mock(ServerBrowser.ServerBrowser)({
           profileReporter: Effect.succeed(() => Effect.void),
         }),
